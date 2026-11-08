@@ -241,8 +241,6 @@ def check_vinted_deals():
 
 
 if __name__ == "__main__":
-    print("🚀 Size-Filtered Streetwear Hunter Active! Sweeping every 90 seconds...")
-    while True:
-        check_vinted_deals()
-        print("☕ Sweep complete. Pausing 90s for fresh uploads...")
-        time.sleep(90)
+    print("🚀 Running cloud sweep for Vinted deals...")
+    check_vinted_deals()
+    print("✅ Sweep complete! Closing cloud runner until next scheduled run.")
