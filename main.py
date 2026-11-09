@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 
@@ -83,10 +84,11 @@ def full_url(raw_url):
 
 
 def send_alert(title, price, url, resell, net_profit, channel):
+    """Returns True if the alert was delivered."""
     webhook = cfg.get_webhook(channel)
     if not webhook:
         print(f"⚠️ No webhook secret set for '{channel}', skipping alert.")
-        return
+        return False
 
     payload = {
         "username": f"{channel.replace('_', ' ').title()} Hunter 🎯",
@@ -96,7 +98,7 @@ def send_alert(title, price, url, resell, net_profit, channel):
             "color": 15158332,
             "fields": [
                 {"name": "Buy Price", "value": f"**£{price:.2f}**", "inline": True},
-                {"name": "Est. Resell", "value": f"**£{resell:.2f}**", "inline": True},
+                {"name": "Conservative Resell", "value": f"**£{resell:.2f}**", "inline": True},
                 {"name": "Est. Net Profit", "value": f"**+£{net_profit:.2f}** 💰", "inline": True},
                 {"name": "🔍 Authenticity Checklist",
                  "value": cfg.CHECKLISTS.get(channel, "Inspect tags & stitching carefully!"),
@@ -106,20 +108,29 @@ def send_alert(title, price, url, resell, net_profit, channel):
         }],
     }
 
+    r = None
     for attempt in range(2):
         r = requests.post(webhook, json=payload, timeout=15)
         if r.status_code == 204:
             print(f"✅ #{channel}: {title} (£{price:.2f}) -> +£{net_profit:.2f}")
-            return
+            return True
         if r.status_code == 429:
             time.sleep(float(r.headers.get("Retry-After", 2)))
             continue
         break
-    print(f"❌ Discord error {r.status_code} for #{channel}")
+    print(f"❌ Discord error {r.status_code if r else '?'} for #{channel}")
+    return False
 
 
 def run():
+    first_run = not os.path.exists(SEEN_FILE)
+    baseline = first_run and cfg.BASELINE_FIRST_RUN
+    if baseline:
+        print("🧠 First run: learning existing listings, no alerts will be sent.")
+
     seen = load_seen()
+    deals = []
+    queued = set()
 
     for t in cfg.TARGETS:
         if t["channel"] not in cfg.ENABLED_CHANNELS:
@@ -144,7 +155,7 @@ def run():
 
         for item in items[: cfg.ITEMS_PER_SEARCH]:
             item_id = str(field(item, "id", ""))
-            if not item_id or item_id in seen:
+            if not item_id or item_id in seen or item_id in queued:
                 continue
 
             title = field(item, "title", "Unknown") or "Unknown"
@@ -155,22 +166,42 @@ def run():
             if price is None:
                 continue
 
-            seen.add(item_id)
+            if baseline:
+                seen.add(item_id)
+                continue
 
-            if is_banned(text):
-                continue
-            if not size_ok(kind, field(item, "size_title"), text):
-                continue
-            if not (min_buy <= price <= max_buy):
+            if (is_banned(text)
+                    or not size_ok(kind, field(item, "size_title"), text)
+                    or not (min_buy <= price <= max_buy)):
+                seen.add(item_id)
                 continue
 
             net_profit = resell * (1 - cfg.RESELL_FEE_PCT) - price - cfg.POSTAGE_COST
-            if net_profit < cfg.MIN_NET_PROFIT:
+            if net_profit < cfg.MIN_NET_PROFIT or net_profit < price * cfg.MIN_ROI:
+                seen.add(item_id)
                 continue
 
-            send_alert(title, price, full_url(field(item, "url")), resell, net_profit, channel)
+            queued.add(item_id)
+            deals.append({
+                "id": item_id, "title": title, "price": price,
+                "url": full_url(field(item, "url")), "resell": resell,
+                "net_profit": net_profit, "channel": channel,
+            })
 
         time.sleep(3)
+
+    # Best deals first, capped so you never get flooded
+    deals.sort(key=lambda d: d["net_profit"], reverse=True)
+    to_send = deals[: cfg.MAX_ALERTS_PER_RUN]
+
+    for d in to_send:
+        if send_alert(d["title"], d["price"], d["url"], d["resell"], d["net_profit"], d["channel"]):
+            seen.add(d["id"])
+        time.sleep(1)
+
+    held = len(deals) - len(to_send)
+    if held > 0:
+        print(f"⏳ {held} more qualifying deals held back for the next run.")
 
     save_seen(seen)
 
