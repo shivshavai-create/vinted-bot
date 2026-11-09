@@ -1,5 +1,4 @@
 import json
-import os
 import re
 import time
 
@@ -123,11 +122,6 @@ def send_alert(title, price, url, resell, net_profit, channel):
 
 
 def run():
-    first_run = not os.path.exists(SEEN_FILE)
-    baseline = first_run and cfg.BASELINE_FIRST_RUN
-    if baseline:
-        print("🧠 First run: learning existing listings, no alerts will be sent.")
-
     seen = load_seen()
     deals = []
     queued = set()
@@ -164,10 +158,6 @@ def run():
             price = parse_price(field(item, "price"))
 
             if price is None:
-                continue
-
-            if baseline:
-                seen.add(item_id)
                 continue
 
             if (is_banned(text)
