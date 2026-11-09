@@ -40,11 +40,13 @@ TARGET_SEARCHES = [
     {"query": "broken planet t-shirt", "target_resell": 25.0, "max_buy": 12.0, "channel": "stussy_bape"},
 ]
 
-# 🛡️ Rep & Bad Condition Blacklist
-BANNED_TITLE_KEYWORDS = [
+# 🛡️ Universal Rep, Junk, Realtree & "Style" Blacklist (Applies to ALL brands)
+BANNED_KEYWORDS = [
+    "realtree", "camo tree", 
+    "style", "styled", "inspired", "type", 
     "rep", "reps", "replica", "fake", "unbranded", "pandabuy", "taobao", "dhgate",
-    "style like", "inspired", "jeans", "pants", "trousers", "denim",
-    "satisfactory", "fair condition", "heavy wear", "damaged", "flawed"
+    "jeans", "pants", "trousers", "denim", "shorts",
+    "satisfactory", "fair condition", "heavy wear", "damaged", "flawed", "spare or repair"
 ]
 
 seen_item_ids = set()
@@ -68,10 +70,11 @@ def is_valid_size(text):
     return False
 
 
-def is_suspicious_title(title):
-    title_lower = title.lower()
-    for keyword in BANNED_TITLE_KEYWORDS:
-        if keyword in title_lower:
+def is_suspicious_listing(full_text):
+    """Scans the combined title and description for any blacklisted spam words."""
+    text_lower = full_text.lower()
+    for keyword in BANNED_KEYWORDS:
+        if keyword in text_lower:
             return True
     return False
 
@@ -152,7 +155,14 @@ def check_vinted_deals():
 
                 full_listing_text = f"{item_title} {item_desc}"
 
+                # 1. Check Size Filter
                 if not is_valid_size(full_listing_text):
+                    if item_id:
+                        seen_item_ids.add(item_id)
+                    continue
+
+                # 2. Check Universal Blacklist (Blocks "realtree", "style", "inspired", pants/jeans, etc.)
+                if is_suspicious_listing(full_listing_text):
                     if item_id:
                         seen_item_ids.add(item_id)
                     continue
@@ -168,6 +178,7 @@ def check_vinted_deals():
 
                 net_profit = target_resell - item_price
 
+                # 3. Check Price and Profit Thresholds
                 if MIN_BUY_PRICE <= item_price <= max_buy and net_profit >= MIN_NET_PROFIT:
                     if not raw_url or raw_url == "0":
                         item_url = "https://www.vinted.co.uk"
@@ -180,11 +191,6 @@ def check_vinted_deals():
                             item_url = raw_url
                     else:
                         item_url = "https://www.vinted.co.uk"
-
-                    if is_suspicious_title(full_listing_text):
-                        if item_id:
-                            seen_item_ids.add(item_id)
-                        continue
 
                     send_discord_alert(
                         title=item_title,
