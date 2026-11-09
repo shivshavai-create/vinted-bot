@@ -15,14 +15,14 @@ def get_webhook(channel):
 # Switch channels on/off here
 ENABLED_CHANNELS = {"carhartt", "dickies", "ralph_lauren"}
 
-# 💰 Strict money rules
+# Strict money rules
 MIN_BUY_PRICE = 5.0
 MIN_NET_PROFIT = 12.0     # profit AFTER fees + postage
 MIN_ROI = 1.0             # profit must be at least 100% of buy price
 RESELL_FEE_PCT = 0.128    # set 0.0 if you resell on Vinted
 POSTAGE_COST = 3.50
 
-# 🔇 Anti-spam
+# Anti-spam
 ITEMS_PER_SEARCH = 10
 MAX_ALERTS_PER_RUN = 5
 
@@ -41,5 +41,30 @@ BANNED_PHRASES = ["camo tree", "fair condition", "heavy wear", "spare or repair"
 CHECKLISTS = {
     "carhartt": "• Check back patch & pocket tag\n• Check zipper brand (YKK/Ideal) & button stamps\n• Check wash tag & stitching",
     "dickies": "• Check embroidered/woven logo quality\n• Check wash tag & stitching\n• Check hardware & zip",
-    "nike_adidas": "• Check tag font, size tag & style code (search it!)\n• Check stitching on logo\n• Shoes: box label, insole print, smell/glue mess",
-    "stussy_supreme": "• HIGH FAKE RISK: check neck tag & wash tag
+    "ralph_lauren": "• Check pony stitching & tag\n• Check RN number / care tag\n• Vintage: check country of origin & label era",
+}
+
+# "resell" = CONSERVATIVE price a weak seller realistically gets.
+# Replace with YOUR real sold prices when you have them!
+TARGETS = [
+    # CARHARTT
+    {"query": "carhartt jacket", "resell": 32, "max_buy": 14, "channel": "carhartt", "kind": "tops"},
+    {"query": "carhartt detroit jacket", "resell": 50, "max_buy": 25, "channel": "carhartt", "kind": "tops"},
+    {"query": "carhartt santa fe jacket", "resell": 45, "max_buy": 22, "channel": "carhartt", "kind": "tops"},
+    {"query": "carhartt active jacket", "resell": 38, "max_buy": 17, "channel": "carhartt", "kind": "tops"},
+    {"query": "carhartt vintage coat", "resell": 35, "max_buy": 15, "channel": "carhartt", "kind": "tops"},
+    {"query": "carhartt double knee pants", "resell": 38, "max_buy": 17, "channel": "carhartt", "kind": "bottoms"},
+    {"query": "carhartt single knee pants", "resell": 30, "max_buy": 10, "channel": "carhartt", "kind": "bottoms"},
+    {"query": "carhartt carpenter jeans", "resell": 28, "max_buy": 8, "channel": "carhartt", "kind": "bottoms"},
+
+    # DICKIES
+    {"query": "dickies eisenhower jacket", "resell": 32, "max_buy": 12, "channel": "dickies", "kind": "tops"},
+    {"query": "dickies duck jacket", "resell": 28, "max_buy": 8, "channel": "dickies", "kind": "tops"},
+
+    # RALPH LAUREN
+    {"query": "polo sport ralph lauren", "resell": 35, "max_buy": 14, "channel": "ralph_lauren", "kind": "tops"},
+    {"query": "ralph lauren rugby shirt", "resell": 30, "max_buy": 10, "channel": "ralph_lauren", "kind": "tops"},
+    {"query": "ralph lauren quarter zip", "resell": 26, "max_buy": 7, "channel": "ralph_lauren", "kind": "tops"},
+    {"query": "ralph lauren cable knit jumper", "resell": 32, "max_buy": 12, "channel": "ralph_lauren", "kind": "tops"},
+    {"query": "ralph lauren harrington jacket", "resell": 42, "max_buy": 20, "channel": "ralph_lauren", "kind": "tops"},
+]
