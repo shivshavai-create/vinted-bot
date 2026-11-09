@@ -2,7 +2,7 @@ import time
 import requests
 from vinted_scraper import VintedScraper
 
-# 🎯 Dedicated Webhooks per Brand Channel (Paste your copied webhook URLs here)
+# 🎯 Dedicated Webhooks per Brand Channel
 WEBHOOKS = {
     "carhartt": "https://discordapp.com/api/webhooks/1569080189470638310/XXsJJJ_hcLXMtb-z71kgwKb62TTGWXFRE21GoSZkvqpZatMGy9P9aIjCUhmS52eY3fJ6", # Default channel
     "ralph_lauren": "https://discordapp.com/api/webhooks/1569080189470638310/XXsJJJ_hcLXMtb-z71kgwKb62TTGWXFRE21GoSZkvqpZatMGy9P9aIjCUhmS52eY3fJ6",
@@ -120,7 +120,7 @@ def check_vinted_deals():
         max_buy = target["max_buy"]
         channel_key = target["channel"]
 
-        print(f"🔎 Scanning Vinted for '{query_text}'...")
+        print(f"\n🔎 Scanning Vinted for '{query_text}'...")
 
         try:
             search_params = {
@@ -129,6 +129,10 @@ def check_vinted_deals():
             }
 
             items = scraper.search(search_params)
+            print(f"📦 Vinted returned {len(items) if items else 0} raw items for '{query_text}'")
+
+            if not items:
+                continue
 
             for item in items[:6]:
                 item_id = str(
@@ -137,6 +141,7 @@ def check_vinted_deals():
                 )
 
                 if item_id and item_id in seen_item_ids:
+                    print(f"⏩ Skipping already seen item ID: {item_id}")
                     continue
 
                 if isinstance(item, dict):
@@ -151,18 +156,21 @@ def check_vinted_deals():
                     raw_url = getattr(item, "url", "https://www.vinted.co.uk")
 
                 if raw_price is None:
+                    print(f"⚠️ Skipped '{item_title}': No price found.")
                     continue
 
                 full_listing_text = f"{item_title} {item_desc}"
 
                 # 1. Check Size Filter
                 if not is_valid_size(full_listing_text):
+                    print(f"📏 Skipped (Size mismatch): '{item_title}'")
                     if item_id:
                         seen_item_ids.add(item_id)
                     continue
 
                 # 2. Check Universal Blacklist (Blocks "realtree", "style", "inspired", pants/jeans, etc.)
                 if is_suspicious_listing(full_listing_text):
+                    print(f"🚫 Skipped (Blacklist/Junk): '{item_title}'")
                     if item_id:
                         seen_item_ids.add(item_id)
                     continue
@@ -174,9 +182,12 @@ def check_vinted_deals():
                     else:
                         item_price = float(raw_price)
                 except (ValueError, TypeError):
+                    print(f"⚠️ Skipped '{item_title}': Invalid price format '{raw_price}'")
                     continue
 
                 net_profit = target_resell - item_price
+
+                print(f"🧮 Checking price £{item_price:.2f} (Max allowed: £{max_buy}) | Profit: £{net_profit:.2f} (Min required: £{MIN_NET_PROFIT})")
 
                 # 3. Check Price and Profit Thresholds
                 if MIN_BUY_PRICE <= item_price <= max_buy and net_profit >= MIN_NET_PROFIT:
@@ -203,6 +214,8 @@ def check_vinted_deals():
 
                     if item_id:
                         seen_item_ids.add(item_id)
+                else:
+                    print(f"❌ Failed price/profit bounds for: '{item_title}'")
 
             time.sleep(3)
 
