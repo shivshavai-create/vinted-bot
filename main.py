@@ -1,217 +1,212 @@
-import os
-import json
+import time
 import requests
+from vinted_scraper import VintedScraper
 
-# Safely try loading local .env file (for local testing), skip on GitHub Actions
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-SEEN_FILE = "seen_items.json"
-
-# Webhook mapping (read from environment variables / GitHub Secrets)
-WEBHOOK_MAP = {
-    "Stussy": os.environ.get("WEBHOOK_STUSSY_SUPREME"),
-    "Supreme": os.environ.get("WEBHOOK_STUSSY_SUPREME"),
-    "Carhartt": os.environ.get("WEBHOOK_CARHARTT"),
-    "Ralph Lauren": os.environ.get("WEBHOOK_RALPH_LAUREN"),
-    "Nike": os.environ.get("WEBHOOK_NIKE_ADIDAS"),
-    "Adidas": os.environ.get("WEBHOOK_NIKE_ADIDAS")
+# 🎯 Dedicated Webhooks per Brand Channel (Paste your copied webhook URLs here)
+WEBHOOKS = {
+    "carhartt": "https://discordapp.com/api/webhooks/1569080189470638310/XXsJJJ_hcLXMtb-z71kgwKb62TTGWXFRE21GoSZkvqpZatMGy9P9aIjCUhmS52eY3fJ6", # Default channel
+    "ralph_lauren": "https://discordapp.com/api/webhooks/1569080189470638310/XXsJJJ_hcLXMtb-z71kgwKb62TTGWXFRE21GoSZkvqpZatMGy9P9aIjCUhmS52eY3fJ6",
+    "supreme_palace": "https://discordapp.com/api/webhooks/1569080189470638310/XXsJJJ_hcLXMtb-z71kgwKb62TTGWXFRE21GoSZkvqpZatMGy9P9aIjCUhmS52eY3fJ6",
+    "stussy_bape": "https://discordapp.com/api/webhooks/1569080189470638310/XXsJJJ_hcLXMtb-z71kgwKb62TTGWXFRE21GoSZkvqpZatMGy9P9aIjCUhmS52eY3fJ6",
 }
 
-DEFAULT_WEBHOOK = os.environ.get("WEBHOOK_CARHARTT")
+# 💰 Baseline Rules
+MIN_BUY_PRICE = 6.0
+MIN_NET_PROFIT = 10.0
 
-# 🚫 BLACKLIST / NEGATIVE FILTERS
-EXCLUDED_KEYWORDS = [
-    "realtree", 
-    "style", 
-    "inspired", 
-    "replica", 
-    "fake", 
-    "custom", 
-    "print", 
-    "copy", 
-    "bootleg"
+# 🎯 Target Searches mapped to specific Discord channels
+TARGET_SEARCHES = [
+    # Carhartt Channel
+    {"query": "carhartt jacket", "target_resell": 45.0, "max_buy": 25.0, "channel": "carhartt"},
+    {"query": "carhartt hoodie", "target_resell": 32.0, "max_buy": 18.0, "channel": "carhartt"},
+    {"query": "carhartt Detroit", "target_resell": 65.0, "max_buy": 40.0, "channel": "carhartt"},
+    
+    # Ralph Lauren Channel
+    {"query": "ralph lauren fleece", "target_resell": 30.0, "max_buy": 15.0, "channel": "ralph_lauren"},
+    {"query": "ralph lauren jacket", "target_resell": 38.0, "max_buy": 20.0, "channel": "ralph_lauren"},
+    {"query": "ralph lauren bear hoodie", "target_resell": 35.0, "max_buy": 18.0, "channel": "ralph_lauren"},
+    
+    # Supreme & Palace Channel
+    {"query": "supreme hoodie", "target_resell": 55.0, "max_buy": 32.0, "channel": "supreme_palace"},
+    {"query": "supreme t-shirt", "target_resell": 28.0, "max_buy": 14.0, "channel": "supreme_palace"},
+    {"query": "palace hoodie", "target_resell": 48.0, "max_buy": 26.0, "channel": "supreme_palace"},
+    {"query": "palace t-shirt", "target_resell": 25.0, "max_buy": 12.0, "channel": "supreme_palace"},
+
+    # Stüssy, Bape & Broken Planet Channel
+    {"query": "stussy hoodie", "target_resell": 40.0, "max_buy": 22.0, "channel": "stussy_bape"},
+    {"query": "stussy t-shirt", "target_resell": 24.0, "max_buy": 10.0, "channel": "stussy_bape"},
+    {"query": "bape ape head tee", "target_resell": 32.0, "max_buy": 16.0, "channel": "stussy_bape"},
+    {"query": "broken planet hoodie", "target_resell": 45.0, "max_buy": 25.0, "channel": "stussy_bape"},
+    {"query": "broken planet t-shirt", "target_resell": 25.0, "max_buy": 12.0, "channel": "stussy_bape"},
 ]
 
+# 🛡️ Rep & Bad Condition Blacklist
+BANNED_TITLE_KEYWORDS = [
+    "rep", "reps", "replica", "fake", "unbranded", "pandabuy", "taobao", "dhgate",
+    "style like", "inspired", "jeans", "pants", "trousers", "denim",
+    "satisfactory", "fair condition", "heavy wear", "damaged", "flawed"
+]
 
-def load_seen_items():
-    """Loads the set of previously alert-sent item IDs from file."""
-    if os.path.exists(SEEN_FILE):
-        try:
-            with open(SEEN_FILE, "r") as f:
-                return set(json.load(f))
-        except json.JSONDecodeError:
-            return set()
-    return set()
-
-
-def save_seen_items(seen_items):
-    """Saves the last 1,000 item IDs to keep the file small."""
-    recent_items = list(seen_items)[-1000:]
-    with open(SEEN_FILE, "w") as f:
-        json.dump(recent_items, f, indent=2)
+seen_item_ids = set()
+scraper = VintedScraper("https://www.vinted.co.uk")
 
 
-def passes_negative_filters(item):
-    """Checks if the item contains any blacklisted scam or unwanted keywords."""
-    title = item.get("title", "").lower()
-    description = item.get("description", "").lower()
-    full_text = f"{title} {description}"
+def is_valid_size(text):
+    text_lower = text.lower()
+    valid_markers = ["medium", "large", "extra large", " sz m", " sz l", " sz xl", "size m", "size l", "size xl"]
+    exact_tokens = [" m ", " l ", " xl ", "(m)", "(l)", "(xl)", "[m]", "[l]", "[xl]"]
 
-    for bad_word in EXCLUDED_KEYWORDS:
-        if bad_word in full_text:
-            print(f"🚫 Filtered out junk containing '{bad_word}': {item.get('title')}")
-            return False
-    return True
+    for marker in valid_markers:
+        if marker in text_lower:
+            return True
+    for token in exact_tokens:
+        if token in text_lower:
+            return True
+    if text_lower.endswith(" m") or text_lower.endswith(" l") or text_lower.endswith(" xl"):
+        return True
+
+    return False
 
 
-def send_discord_alert(item):
-    """Routes the item alert to the specific Discord webhook channel."""
-    brand = item.get("brand", "").strip()
-    
-    # Select specific brand webhook, or fallback to default
-    webhook_url = WEBHOOK_MAP.get(brand) or DEFAULT_WEBHOOK
-    
-    if not webhook_url:
-        print(f"⚠️ Warning: No webhook configured for brand '{brand}'. Check your GitHub Secrets!")
-        return
+def is_suspicious_title(title):
+    title_lower = title.lower()
+    for keyword in BANNED_TITLE_KEYWORDS:
+        if keyword in title_lower:
+            return True
+    return False
 
-    embed = {
-        "title": f"🚨 {item.get('title', 'Steal Alert!')}",
-        "url": item.get("url", "#"),
-        "color": 3066993,  # Green accent
-        "fields": [
-            {"name": "Price", "value": f'£{item.get("price")}', "inline": True},
-            {"name": "Size", "value": str(item.get("size")), "inline": True},
-            {"name": "Brand", "value": brand, "inline": True},
-            {"name": "Est. Net Profit", "value": f'£{item.get("profit", 10)}+', "inline": True}
+
+def send_discord_alert(title, price, item_url, target_resell, net_profit, channel_key):
+    """Sends alert to the specific Discord webhook channel."""
+    price_val = float(price)
+    target_webhook = WEBHOOKS.get(channel_key, WEBHOOKS["carhartt"])
+
+    payload = {
+        "username": f"{channel_key.replace('_', ' ').title()} Hunter 🎯",
+        "embeds": [
+            {
+                "title": f"🔥 M/L/XL STEAL: {title}",
+                "url": item_url,
+                "color": 15158332,
+                "fields": [
+                    {"name": "Buy Price", "value": f"**£{price_val:.2f}**", "inline": True},
+                    {"name": "Est. Resell", "value": f"**£{target_resell:.2f}**", "inline": True},
+                    {"name": "Est. Net Profit", "value": f"**+£{net_profit:.2f}** 💰", "inline": True},
+                    {
+                        "name": "🔍 Quick Authenticity Checklist",
+                        "value": "• Check care tag stitching & neck tag density\n• Check logo alignment & embroidery\n• Review seller rating",
+                        "inline": False,
+                    },
+                ],
+                "footer": {"text": "Tap title to inspect & buy on Vinted!"},
+            }
         ],
-        "footer": {"text": "DealHunt HQ • Automated Alert"}
     }
 
-    try:
-        response = requests.post(webhook_url, json={"embeds": [embed]}, timeout=10)
-        if response.status_code in [200, 204]:
-            print(f"✅ Alert sent successfully for '{item.get('title')}'!")
-        else:
-            print(f"❌ Failed to send alert ({response.status_code}): {response.text}")
-    except Exception as e:
-        print(f"❌ Webhook request error: {e}")
+    response = requests.post(target_webhook, json=payload)
+    if response.status_code == 204:
+        print(f"✅ Alert sent to #{channel_key}: {title} (£{price_val:.2f}) -> Profit: +£{net_profit:.2f}")
+    else:
+        print(f"❌ Failed to send alert to #{channel_key}: {response.status_code}")
 
 
-def fetch_vinted_deals():
-    """
-    Initializes a session to obtain Vinted cookies and fetches live catalog listings.
-    """
-    all_found_items = []
-    
-    search_queries = [
-        "Carhartt Detroit Jacket",
-        "Stussy hoodie",
-        "Supreme tee",
-        "Ralph Lauren half zip",
-        "Nike vintage sweater",
-        "Adidas vintage jacket"
-    ]
-    
-    # Use a persistent session to retain session cookies
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-GB,en;q=0.9"
-    })
+def check_vinted_deals():
+    for target in TARGET_SEARCHES:
+        query_text = target["query"]
+        target_resell = target["target_resell"]
+        max_buy = target["max_buy"]
+        channel_key = target["channel"]
 
-    # Step 1: Hit Vinted homepage to obtain session cookies
-    try:
-        init_res = session.get("https://www.vinted.co.uk", timeout=10)
-        print(f"🌐 Vinted session initialization status: {init_res.status_code}")
-    except Exception as e:
-        print(f"⚠️ Session init failed: {e}")
+        print(f"🔎 Scanning Vinted for '{query_text}'...")
 
-    # Step 2: Query the API endpoints
-    for query in search_queries:
         try:
-            url = f"https://www.vinted.co.uk/api/v2/catalog/items?search_text={query}&order=newest_first"
-            response = session.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                items = data.get("items", [])
-                print(f"🔎 Query '{query}': fetched {len(items)} items.")
-                
-                for item in items:
-                    item_id = str(item.get("id"))
-                    title = item.get("title", "")
-                    price = float(item.get("price", 0))
-                    
-                    # Extract brand title
-                    brand_info = item.get("brand_title") or item.get("brand", {})
-                    brand = brand_info if isinstance(brand_info, str) else brand_info.get("title", "Unknown")
-                    
-                    size = str(item.get("size_title", ""))
-                    item_url = item.get("url", "")
-                    description = item.get("description", "")
-                    
-                    all_found_items.append({
-                        "id": item_id,
-                        "title": title,
-                        "brand": brand,
-                        "size": size,
-                        "price": price,
-                        "profit": 12.0,  # Baseline profit for testing
-                        "url": item_url,
-                        "description": description
-                    })
-            else:
-                print(f"⚠️ Vinted API returned HTTP {response.status_code} for query '{query}'")
-                
+            search_params = {
+                "search_text": query_text,
+                "order": "newest_first",
+            }
+
+            items = scraper.search(search_params)
+
+            for item in items[:6]:
+                item_id = str(
+                    getattr(item, "id", None)
+                    or (item.get("id") if isinstance(item, dict) else None)
+                )
+
+                if item_id and item_id in seen_item_ids:
+                    continue
+
+                if isinstance(item, dict):
+                    raw_price = item.get("price")
+                    item_title = item.get("title", "Unknown Item")
+                    item_desc = item.get("description", "") or ""
+                    raw_url = item.get("url", "https://www.vinted.co.uk")
+                else:
+                    raw_price = getattr(item, "price", None)
+                    item_title = getattr(item, "title", "Unknown Item")
+                    item_desc = getattr(item, "description", "") or ""
+                    raw_url = getattr(item, "url", "https://www.vinted.co.uk")
+
+                if raw_price is None:
+                    continue
+
+                full_listing_text = f"{item_title} {item_desc}"
+
+                if not is_valid_size(full_listing_text):
+                    if item_id:
+                        seen_item_ids.add(item_id)
+                    continue
+
+                try:
+                    if isinstance(raw_price, str):
+                        clean_str = "".join(c for c in raw_price if c.isdigit() or c == ".")
+                        item_price = float(clean_str)
+                    else:
+                        item_price = float(raw_price)
+                except (ValueError, TypeError):
+                    continue
+
+                net_profit = target_resell - item_price
+
+                if MIN_BUY_PRICE <= item_price <= max_buy and net_profit >= MIN_NET_PROFIT:
+                    if not raw_url or raw_url == "0":
+                        item_url = "https://www.vinted.co.uk"
+                    elif isinstance(raw_url, str):
+                        if raw_url.startswith("/"):
+                            item_url = f"https://www.vinted.co.uk{raw_url}"
+                        elif not raw_url.startswith("http"):
+                            item_url = f"https://www.vinted.co.uk/{raw_url.lstrip('/')}"
+                        else:
+                            item_url = raw_url
+                    else:
+                        item_url = "https://www.vinted.co.uk"
+
+                    if is_suspicious_title(full_listing_text):
+                        if item_id:
+                            seen_item_ids.add(item_id)
+                        continue
+
+                    send_discord_alert(
+                        title=item_title,
+                        price=item_price,
+                        item_url=item_url,
+                        target_resell=target_resell,
+                        net_profit=net_profit,
+                        channel_key=channel_key,
+                    )
+
+                    if item_id:
+                        seen_item_ids.add(item_id)
+
+            time.sleep(3)
+
         except Exception as e:
-            print(f"❌ Error fetching query '{query}': {e}")
-
-    print(f"📊 Total items retrieved across queries: {len(all_found_items)}")
-    return all_found_items
-
-
-def main():
-    seen_items = load_seen_items()
-    print(f"🧠 Memory loaded: {len(seen_items)} previously seen item IDs.")
-    
-    new_items_found = fetch_vinted_deals()
-    alerts_sent = 0
-    
-    for item in new_items_found:
-        item_id = str(item.get("id"))
-        
-        # 1. DUPLICATE CHECK
-        if item_id in seen_items:
-            continue
-
-        # 2. SIZE & PROFIT CHECKS (Flexible size matching)
-        raw_size = str(item.get("size", "")).upper()
-        profit = item.get("profit", 0)
-        
-        # Check if any target size (M, L, XL) appears in the size string
-        has_valid_size = any(s in raw_size for s in ["M", "L", "XL"])
-        
-        if not has_valid_size or profit < 10:
-            continue
-
-        # 3. NEGATIVE KEYWORD FILTERS
-        if not passes_negative_filters(item):
-            continue
-
-        # Trigger Discord Alert
-        send_discord_alert(item)
-        seen_items.add(item_id)
-        alerts_sent += 1
-
-    print(f"🏁 Run complete: Sent {alerts_sent} new alerts.")
-    save_seen_items(seen_items)
+            print(f"⚠️ Search loop notice for '{query_text}': {e}")
 
 
 if __name__ == "__main__":
-    main()
+    print("🚀 Multi-Channel Vinted Hunter Active! Checking every 90 seconds...")
+    while True:
+        check_vinted_deals()
+        print("☕ Sweep complete. Pausing 90s for fresh uploads...")
+        time.sleep(90)
