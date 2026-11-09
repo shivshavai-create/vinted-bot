@@ -5,47 +5,47 @@ from vinted_scraper import VintedScraper
 # 🎯 Dedicated Webhooks per Brand Channel
 WEBHOOKS = {
     "carhartt": "https://discordapp.com/api/webhooks/1569080189470638310/XXsJJJ_hcLXMtb-z71kgwKb62TTGWXFRE21GoSZkvqpZatMGy9P9aIjCUhmS52eY3fJ6", # Default channel
-    "ralph_lauren": "https://discordapp.com/api/webhooks/1569080189470638310/XXsJJJ_hcLXMtb-z71kgwKb62TTGWXFRE21GoSZkvqpZatMGy9P9aIjCUhmS52eY3fJ6",
-    "supreme_palace": "https://discordapp.com/api/webhooks/1569080189470638310/XXsJJJ_hcLXMtb-z71kgwKb62TTGWXFRE21GoSZkvqpZatMGy9P9aIjCUhmS52eY3fJ6",
-    "stussy_bape": "https://discordapp.com/api/webhooks/1569080189470638310/XXsJJJ_hcLXMtb-z71kgwKb62TTGWXFRE21GoSZkvqpZatMGy9P9aIjCUhmS52eY3fJ6",
+    "dickies": "https://discordapp.com/api/webhooks/1569080189470638310/XXsJJJ_hcLXMtb-z71kgwKb62TTGWXFRE21GoSZkvqpZatMGy9P9aIjCUhmS52eY3fJ6",
 }
 
 # 💰 Baseline Rules
 MIN_BUY_PRICE = 6.0
 MIN_NET_PROFIT = 10.0
 
-# 🎯 Target Searches mapped to specific Discord channels
+# 🎯 Target Searches focused on Carhartt & Dickies (Jackets + Jeans/Pants)
 TARGET_SEARCHES = [
-    # Carhartt Channel
+    # --- CARHARTT JACKETS & COATS ---
     {"query": "carhartt jacket", "target_resell": 45.0, "max_buy": 25.0, "channel": "carhartt"},
-    {"query": "carhartt hoodie", "target_resell": 32.0, "max_buy": 18.0, "channel": "carhartt"},
-    {"query": "carhartt Detroit", "target_resell": 65.0, "max_buy": 40.0, "channel": "carhartt"},
-    
-    # Ralph Lauren Channel
-    {"query": "ralph lauren fleece", "target_resell": 30.0, "max_buy": 15.0, "channel": "ralph_lauren"},
-    {"query": "ralph lauren jacket", "target_resell": 38.0, "max_buy": 20.0, "channel": "ralph_lauren"},
-    {"query": "ralph lauren bear hoodie", "target_resell": 35.0, "max_buy": 18.0, "channel": "ralph_lauren"},
-    
-    # Supreme & Palace Channel
-    {"query": "supreme hoodie", "target_resell": 55.0, "max_buy": 32.0, "channel": "supreme_palace"},
-    {"query": "supreme t-shirt", "target_resell": 28.0, "max_buy": 14.0, "channel": "supreme_palace"},
-    {"query": "palace hoodie", "target_resell": 48.0, "max_buy": 26.0, "channel": "supreme_palace"},
-    {"query": "palace t-shirt", "target_resell": 25.0, "max_buy": 12.0, "channel": "supreme_palace"},
+    {"query": "carhartt detroit jacket", "target_resell": 70.0, "max_buy": 45.0, "channel": "carhartt"},
+    {"query": "carhartt santa fe jacket", "target_resell": 65.0, "max_buy": 40.0, "channel": "carhartt"},
+    {"query": "carhartt active jacket", "target_resell": 55.0, "max_buy": 32.0, "channel": "carhartt"},
+    {"query": "carhartt vintage coat", "target_resell": 50.0, "max_buy": 30.0, "channel": "carhartt"},
 
-    # Stüssy, Bape & Broken Planet Channel
-    {"query": "stussy hoodie", "target_resell": 40.0, "max_buy": 22.0, "channel": "stussy_bape"},
-    {"query": "stussy t-shirt", "target_resell": 24.0, "max_buy": 10.0, "channel": "stussy_bape"},
-    {"query": "bape ape head tee", "target_resell": 32.0, "max_buy": 16.0, "channel": "stussy_bape"},
-    {"query": "broken planet hoodie", "target_resell": 45.0, "max_buy": 25.0, "channel": "stussy_bape"},
-    {"query": "broken planet t-shirt", "target_resell": 25.0, "max_buy": 12.0, "channel": "stussy_bape"},
+    # --- CARHARTT JEANS & WORK PANTS ---
+    {"query": "carhartt double knee pants", "target_resell": 55.0, "max_buy": 32.0, "channel": "carhartt"},
+    {"query": "carhartt single knee pants", "target_resell": 45.0, "max_buy": 25.0, "channel": "carhartt"},
+    {"query": "carhartt denim jeans", "target_resell": 35.0, "max_buy": 18.0, "channel": "carhartt"},
+    {"query": "carhartt carpenter jeans", "target_resell": 40.0, "max_buy": 22.0, "channel": "carhartt"},
+
+    # --- DICKIES JACKETS ---
+    {"query": "dickies eisenhower jacket", "target_resell": 45.0, "max_buy": 25.0, "channel": "dickies"},
+    {"query": "dickies duck jacket", "target_resell": 40.0, "max_buy": 22.0, "channel": "dickies"},
+    {"query": "dickies vintage jacket", "target_resell": 35.0, "max_buy": 18.0, "channel": "dickies"},
+
+    # --- DICKIES JEANS & WORK PANTS ---
+    {"query": "dickies 874 work pants", "target_resell": 25.0, "max_buy": 12.0, "channel": "dickies"},
+    {"query": "dickies double knee pants", "target_resell": 35.0, "max_buy": 18.0, "channel": "dickies"},
+    {"query": "dickies carpenter jeans", "target_resell": 30.0, "max_buy": 15.0, "channel": "dickies"},
+    {"query": "dickies denim jeans", "target_resell": 28.0, "max_buy": 14.0, "channel": "dickies"},
 ]
 
-# 🛡️ Universal Rep, Junk, Realtree & "Style" Blacklist (Applies to ALL brands)
+# 🛡️ Universal Rep, Junk, Realtree & "Style" Blacklist
+# (Pants/jeans terms removed so they pass through!)
 BANNED_KEYWORDS = [
     "realtree", "camo tree", 
     "style", "styled", "inspired", "type", 
     "rep", "reps", "replica", "fake", "unbranded", "pandabuy", "taobao", "dhgate",
-    "jeans", "pants", "trousers", "denim", "shorts",
+    "shorts",
     "satisfactory", "fair condition", "heavy wear", "damaged", "flawed", "spare or repair"
 ]
 
@@ -54,7 +54,12 @@ scraper = VintedScraper("https://www.vinted.co.uk")
 
 
 def is_valid_size(text):
+    """
+    Checks for tops sizes (M, L, XL) and common waist sizes for jeans/pants (28-38).
+    """
     text_lower = text.lower()
+    
+    # Tops size markers
     valid_markers = ["medium", "large", "extra large", " sz m", " sz l", " sz xl", "size m", "size l", "size xl"]
     exact_tokens = [" m ", " l ", " xl ", "(m)", "(l)", "(xl)", "[m]", "[l]", "[xl]"]
 
@@ -66,6 +71,15 @@ def is_valid_size(text):
             return True
     if text_lower.endswith(" m") or text_lower.endswith(" l") or text_lower.endswith(" xl"):
         return True
+
+    # Jeans & Pants Waist Sizes (W28 to W38, 28x32, 30x32, etc.)
+    waist_sizes = [
+        "28", "30", "31", "32", "33", "34", "36", "38",
+        "w28", "w30", "w31", "w32", "w33", "w34", "w36", "w38"
+    ]
+    for w in waist_sizes:
+        if f" {w} " in f" {text_lower} " or f"w/{w}" in text_lower or f"w{w}" in text_lower:
+            return True
 
     return False
 
@@ -85,10 +99,10 @@ def send_discord_alert(title, price, item_url, target_resell, net_profit, channe
     target_webhook = WEBHOOKS.get(channel_key, WEBHOOKS["carhartt"])
 
     payload = {
-        "username": f"{channel_key.replace('_', ' ').title()} Hunter 🎯",
+        "username": f"{channel_key.replace('_', ' ').title()} Workwear Hunter 🎯",
         "embeds": [
             {
-                "title": f"🔥 M/L/XL STEAL: {title}",
+                "title": f"🔥 WORKWEAR STEAL: {title}",
                 "url": item_url,
                 "color": 15158332,
                 "fields": [
@@ -97,7 +111,7 @@ def send_discord_alert(title, price, item_url, target_resell, net_profit, channe
                     {"name": "Est. Net Profit", "value": f"**+£{net_profit:.2f}** 💰", "inline": True},
                     {
                         "name": "🔍 Quick Authenticity Checklist",
-                        "value": "• Check care tag stitching & neck tag density\n• Check logo alignment & embroidery\n• Review seller rating",
+                        "value": "• Check leather/cloth back patch & pocket tag\n• Check zipper brand (YKK/Ideal) & button stamps\n• Check wash tag & inner stitching",
                         "inline": False,
                     },
                 ],
@@ -161,14 +175,14 @@ def check_vinted_deals():
 
                 full_listing_text = f"{item_title} {item_desc}"
 
-                # 1. Check Size Filter
+                # 1. Check Size Filter (M/L/XL or Waist 28-38)
                 if not is_valid_size(full_listing_text):
                     print(f"📏 Skipped (Size mismatch): '{item_title}'")
                     if item_id:
                         seen_item_ids.add(item_id)
                     continue
 
-                # 2. Check Universal Blacklist (Blocks "realtree", "style", "inspired", pants/jeans, etc.)
+                # 2. Check Universal Blacklist (Blocks "realtree", "style", "inspired", reps, etc.)
                 if is_suspicious_listing(full_listing_text):
                     print(f"🚫 Skipped (Blacklist/Junk): '{item_title}'")
                     if item_id:
@@ -224,8 +238,6 @@ def check_vinted_deals():
 
 
 if __name__ == "__main__":
-    print("🚀 Multi-Channel Vinted Hunter Active! Checking every 90 seconds...")
-    while True:
-        check_vinted_deals()
-        print("☕ Sweep complete. Pausing 90s for fresh uploads...")
-        time.sleep(90)
+    print("🚀 Carhartt & Dickies Workwear Hunter Sweep Starting...")
+    check_vinted_deals()
+    print("☕ Sweep complete. Shutting down until next hourly trigger!")
