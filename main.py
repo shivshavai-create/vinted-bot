@@ -86,35 +86,16 @@ def send_alert(title, price, url, resell, net_profit, channel):
     """Returns True if the alert was delivered."""
     webhook = cfg.get_webhook(channel)
     if not webhook:
-        print(f"⚠️ No webhook secret set for '{channel}', skipping alert.")
+        print(f"[WARN] No webhook secret set for '{channel}', skipping alert.")
         return False
 
     payload = {
-        "username": f"{channel.replace('_', ' ').title()} Hunter 🎯",
+        "username": f"{channel.replace('_', ' ').title()} Hunter",
         "embeds": [{
-            "title": f"🔥 STEAL: {title}"[:256],
+            "title": f"\U0001F525 STEAL: {title}"[:256],
             "url": url,
             "color": 15158332,
             "fields": [
-                {"name": "Buy Price", "value": f"**£{price:.2f}**", "inline": True},
-                {"name": "Conservative Resell", "value": f"**£{resell:.2f}**", "inline": True},
-                {"name": "Est. Net Profit", "value": f"**+£{net_profit:.2f}** 💰", "inline": True},
-                {"name": "🔍 Authenticity Checklist",
-                 "value": cfg.CHECKLISTS.get(channel, "Inspect tags & stitching carefully!"),
-                 "inline": False},
-            ],
-            "footer": {"text": "Profit is after fees + postage. Verify before buying!"},
-        }],
-    }
-
-    r = None
-    for attempt in range(2):
-        r = requests.post(webhook, json=payload, timeout=15)
-        if r.status_code == 204:
-            print(f"✅ #{channel}: {title} (£{price:.2f}) -> +£{net_profit:.2f}")
-            return True
-        if r.status_code == 429:
-            time.sleep(float(r.headers.get("Retry-After", 2)))
-            continue
-        break
-    print(f"❌
+                {"name": "Buy Price", "value": f"**GBP {price:.2f}**", "inline": True},
+                {"name": "Conservative Resell", "value": f"**GBP {resell:.2f}**", "inline": True},
+                {"name": "Est. Net Profit", "value": f"**+GBP {net_profit:.2f}** \U0001F4B0", "inline": True},
