@@ -1,10 +1,14 @@
 import os
 import json
 import requests
-from dotenv import load_dotenv
 
-# Load local .env file if running on your laptop
-load_dotenv()
+# Tries to load local .env file (for your laptop), 
+# but safely skips if it's running on GitHub Actions!
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 SEEN_FILE = "seen_items.json"
 
