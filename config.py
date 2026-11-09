@@ -18,7 +18,7 @@ MIN_BUY_PRICE = 5.0
 MIN_NET_PROFIT = 12.0
 MIN_ROI = 1.0
 RESELL_FEE_PCT = 0.128
-POSTAGE_COST = 3.50
+POSTAGE_COST = 2.50
 
 ITEMS_PER_SEARCH = 10
 MAX_ALERTS_PER_RUN = 5
@@ -30,9 +30,20 @@ SHOE_RANGE = (7, 11)
 BANNED_WORDS = [
     "realtree", "style", "styled", "inspired", "type",
     "rep", "reps", "replica", "fake", "unbranded", "pandabuy", "taobao", "dhgate",
-    "shorts", "satisfactory", "damaged", "flawed", "stained", "faded",
+    "shorts", "satisfactory", "damaged", "flawed", "stained",
 ]
 BANNED_PHRASES = ["camo tree", "fair condition", "heavy wear", "spare or repair"]
+
+# Extra banned words for ONE channel only (faded is fine for workwear, not for Ralph Lauren)
+EXTRA_BANNED_BY_CHANNEL = {
+    "ralph_lauren": ["faded"],
+}
+
+# Kids filter: checked against the TITLE and SIZE only
+KIDS_WORDS = [
+    "kids", "kid", "boy", "boys", "girl", "girls", "child", "children", "childrens",
+    "youth", "junior", "juniors", "toddler", "baby", "infant",
+]
 
 CHECKLISTS = {
     "carhartt": "Check back patch and pocket tag, zip brand (YKK/Ideal), wash tag and stitching",
