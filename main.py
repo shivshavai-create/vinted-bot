@@ -79,23 +79,151 @@ def full_url(raw_url):
         return BASE_URL
     if raw_url.startswith("http"):
         return raw_url
-    return f"{BASE_URL}/{raw_url.lstrip('/')}"
+    return BASE_URL + "/" + raw_url.lstrip("/")
 
 
 def send_alert(title, price, url, resell, net_profit, channel):
-    """Returns True if the alert was delivered."""
+    """Sends a simple text alert. Returns True if delivered."""
     webhook = cfg.get_webhook(channel)
     if not webhook:
-        print(f"[WARN] No webhook secret set for '{channel}', skipping alert.")
+        print("[WARN] No webhook secret set for " + channel)
         return False
 
-    payload = {
-        "username": f"{channel.replace('_', ' ').title()} Hunter",
-        "embeds": [{
-            "title": f"\U0001F525 STEAL: {title}"[:256],
-            "url": url,
-            "color": 15158332,
-            "fields": [
-                {"name": "Buy Price", "value": f"**GBP {price:.2f}**", "inline": True},
-                {"name": "Conservative Resell", "value": f"**GBP {resell:.2f}**", "inline": True},
-                {"name": "Est. Net Profit", "value": f"**+GBP {net_profit:.2f}** \U0001F4B0", "inline": True},
+    check = cfg.CHECKLISTS.get(channel, "Inspect tags and stitching carefully")
+    lines = [
+        "\U0001F525 **" + title + "**",
+        "Buy: **GBP " + format(price, ".2f") + "**  |  Resell: GBP " + format(resell, ".2f")
+        + "  |  Profit: **+GBP " + format(net_profit, ".2f") + "** \U0001F4B0",
+        "\U0001F50D " + check,
+        url,
+    ]
+    payload = {"username": "Deal Hunter", "content": "\n".join(lines)}
+
+    r = None
+    for attempt in range(2):
+        r = requests.post(webhook, json=payload, timeout=15)
+        if r.status_code in (200, 204):
+            print("[SENT] #" + channel + ": " + title)
+            return True
+        if r.status_code == 429:
+            time.sleep(float(r.headers.get("Retry-After", 2)))
+            continue
+        break
+    print("[ERROR] Discord status " + str(r.status_code if r else "?") + " for #" + channel)
+    return False
+
+
+def run():
+    seen = load_seen()
+    deals = []
+    queued = set()
+    near_misses = []
+    stats = {"checked": 0, "already_seen": 0, "junk_or_size": 0,
+             "price_out_of_range": 0, "low_profit": 0, "qualified": 0}
+
+    for ch in sorted(cfg.ENABLED_CHANNELS):
+        found = "yes" if cfg.get_webhook(ch) else "NO - secret missing or name mismatch"
+        print("[CHECK] Webhook for " + ch + ": " + found)
+
+    for t in cfg.TARGETS:
+        if t["channel"] not in cfg.ENABLED_CHANNELS:
+            continue
+
+        query, resell, max_buy = t["query"], float(t["resell"]), float(t["max_buy"])
+        min_buy = float(t.get("min_buy", cfg.MIN_BUY_PRICE))
+        channel, kind = t["channel"], t.get("kind")
+
+        print("\n[SEARCH] " + query)
+        try:
+            items = scraper.search({"search_text": query, "order": "newest_first"})
+        except Exception as e:
+            print("[WARN] Search failed: " + str(e))
+            time.sleep(3)
+            continue
+
+        if not items:
+            print("[WARN] 0 items (possible block or empty search)")
+            time.sleep(3)
+            continue
+
+        for item in items[: cfg.ITEMS_PER_SEARCH]:
+            item_id = str(field(item, "id", ""))
+            if not item_id or item_id in queued:
+                continue
+
+            stats["checked"] += 1
+            if item_id in seen:
+                stats["already_seen"] += 1
+                continue
+
+            title = field(item, "title", "Unknown") or "Unknown"
+            desc = field(item, "description", "") or ""
+            text = title + " " + desc
+            price = parse_price(field(item, "price"))
+
+            if price is None:
+                continue
+
+            if is_banned(text) or not size_ok(kind, field(item, "size_title"), text):
+                stats["junk_or_size"] += 1
+                seen.add(item_id)
+                continue
+
+            if not (min_buy <= price <= max_buy):
+                stats["price_out_of_range"] += 1
+                seen.add(item_id)
+                continue
+
+            net_profit = resell * (1 - cfg.RESELL_FEE_PCT) - price - cfg.POSTAGE_COST
+            if net_profit < cfg.MIN_NET_PROFIT or net_profit < price * cfg.MIN_ROI:
+                stats["low_profit"] += 1
+                near_misses.append((net_profit, title, price, channel))
+                seen.add(item_id)
+                continue
+
+            stats["qualified"] += 1
+            queued.add(item_id)
+            deals.append({
+                "id": item_id, "title": title, "price": price,
+                "url": full_url(field(item, "url")), "resell": resell,
+                "net_profit": net_profit, "channel": channel,
+            })
+
+        time.sleep(3)
+
+    deals.sort(key=lambda d: d["net_profit"], reverse=True)
+    to_send = deals[: cfg.MAX_ALERTS_PER_RUN]
+
+    sent = 0
+    for d in to_send:
+        if send_alert(d["title"], d["price"], d["url"], d["resell"], d["net_profit"], d["channel"]):
+            seen.add(d["id"])
+            sent += 1
+        time.sleep(1)
+
+    held = len(deals) - len(to_send)
+    if held > 0:
+        print("[INFO] " + str(held) + " more qualifying deals held for next run")
+
+    save_seen(seen)
+
+    print("\n===== SUMMARY =====")
+    print("Listings checked:        " + str(stats["checked"]))
+    print("Already seen (skipped):  " + str(stats["already_seen"]))
+    print("Junk word / wrong size:  " + str(stats["junk_or_size"]))
+    print("Price out of range:      " + str(stats["price_out_of_range"]))
+    print("Profit too low:          " + str(stats["low_profit"]))
+    print("Qualified deals:         " + str(stats["qualified"]))
+    print("Alerts sent to Discord:  " + str(sent))
+
+    if near_misses:
+        near_misses.sort(reverse=True)
+        print("\nClosest near-misses (profit too low):")
+        for profit, title, price, channel in near_misses[:5]:
+            print("  GBP " + format(price, ".2f") + " '" + title[:50] + "' -> profit GBP " + format(profit, ".2f"))
+
+
+if __name__ == "__main__":
+    print("Hunter sweep starting...")
+    run()
+    print("Sweep complete.")
