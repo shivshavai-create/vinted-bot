@@ -44,9 +44,25 @@ def parse_price(raw):
         return None
 
 
-def is_banned(text):
+KIDS_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.KIDS_WORDS) + r")\b", re.I)
+KIDS_SIZE_RE = re.compile(r"\b\d+\s*(?:-\s*\d+\s*)?(?:y|yr|yrs|year|years|month|months|cm)\b", re.I)
+
+
+def is_banned(text, channel):
     low = text.lower()
-    return bool(BANNED_RE.search(low)) or any(p in low for p in cfg.BANNED_PHRASES)
+    if BANNED_RE.search(low) or any(p in low for p in cfg.BANNED_PHRASES):
+        return True
+    for word in cfg.EXTRA_BANNED_BY_CHANNEL.get(channel, []):
+        if re.search(r"\b" + re.escape(word) + r"\b", low):
+            return True
+    return False
+
+
+def is_kids(title, size_title):
+    size_text = size_title or ""
+    if KIDS_RE.search(title + " " + size_text):
+        return True
+    return bool(KIDS_SIZE_RE.search(size_text))
 
 
 def size_ok(kind, size_title, text):
@@ -118,7 +134,7 @@ def run():
     deals = []
     queued = set()
     near_misses = []
-    stats = {"checked": 0, "already_seen": 0, "junk_or_size": 0,
+    stats = {"checked": 0, "already_seen": 0, "kids": 0, "junk_or_size": 0,
              "price_out_of_range": 0, "low_profit": 0, "qualified": 0}
 
     for ch in sorted(cfg.ENABLED_CHANNELS):
@@ -164,7 +180,14 @@ def run():
             if price is None:
                 continue
 
-            if is_banned(text) or not size_ok(kind, field(item, "size_title"), text):
+            size_title = field(item, "size_title")
+
+            if is_kids(title, size_title):
+                stats["kids"] += 1
+                seen.add(item_id)
+                continue
+
+            if is_banned(text, channel) or not size_ok(kind, size_title, text):
                 stats["junk_or_size"] += 1
                 seen.add(item_id)
                 continue
@@ -210,6 +233,7 @@ def run():
     print("\n===== SUMMARY =====")
     print("Listings checked:        " + str(stats["checked"]))
     print("Already seen (skipped):  " + str(stats["already_seen"]))
+    print("Kids items blocked:      " + str(stats["kids"]))
     print("Junk word / wrong size:  " + str(stats["junk_or_size"]))
     print("Price out of range:      " + str(stats["price_out_of_range"]))
     print("Profit too low:          " + str(stats["low_profit"]))
