@@ -14,6 +14,7 @@ BASE_URL = "https://www.vinted.co.uk"
 SEEN_FILE = "seen.json"
 STATS_FILE = "stats.json"
 VALID_KINDS = {"tops", "bottoms", "shoes", None}
+POUND = "\u00a3"
 
 scraper = VintedScraper(BASE_URL)
 
@@ -138,6 +139,9 @@ def validate_config():
             errors.append(label + " has invalid kind '" + str(t.get("kind")) + "' (use tops, bottoms, shoes)")
         if max_buy >= resell:
             warnings.append(label + ": max_buy is not below resell, it can never profit")
+        t_min_buy = to_float(t.get("min_buy", cfg.MIN_BUY_PRICE))
+        if t["channel"] in cfg.ENABLED_CHANNELS and t_min_buy is not None and max_buy < t_min_buy:
+            warnings.append(label + ": max_buy is below the minimum buy price, it can never alert")
 
     for ch in sorted(cfg.ENABLED_CHANNELS):
         if not cfg.get_webhook(ch):
@@ -251,8 +255,9 @@ def apply_tier(channel, title, resell, max_buy):
         if any(w in low for w in tier["words"]):
             if best is None or tier["resell"] > best["resell"]:
                 best = tier
-    if best:
-        return float(best["resell"]), float(best["max_buy"]), best["words"][0]
+    if best and float(best["resell"]) > resell:
+        tier_max = best.get("max_buy") or cfg.max_buy_for(float(best["resell"]), channel)
+        return float(best["resell"]), max(max_buy, float(tier_max)), best["words"][0]
     return resell, max_buy, None
 
 
@@ -265,9 +270,18 @@ def find_rare(channel, text):
 
 
 def sold_link(title):
-    words = re.findall(r"[A-Za-z0-9]+", title)[:7]
+    words = re.findall(r"\w+", title)[:7]
     q = urllib.parse.quote_plus(" ".join(words))
     return "https://www.ebay.co.uk/sch/i.html?_nkw=" + q + "&LH_Sold=1&LH_Complete=1"
+
+
+def suggest_offer(price):
+    if not cfg.OFFER_ENABLED or price < cfg.OFFER_MIN_PRICE:
+        return None
+    offer = round(price * cfg.OFFER_PERCENT * 2) / 2.0
+    if offer >= price:
+        return None
+    return max(offer, 1.0)
 
 
 # ---------------------------------------------------------------
@@ -315,9 +329,15 @@ def send_alert(d):
 
     lines = [
         "\U0001F525 **" + d["title"] + "**",
-        "Buy: **GBP " + format(d["price"], ".2f") + "**  |  Resell: GBP " + format(d["resell"], ".2f")
-        + "  |  Profit: **+GBP " + format(d["net_profit"], ".2f") + "** \U0001F4B0",
+        "Ask: **" + POUND + format(d["price"], ".2f") + "**  |  Resell: " + POUND + format(d["resell"], ".2f"),
     ]
+    if d["offer"] is not None:
+        lines.append("Profit at asking: **+" + POUND + format(d["net_profit"], ".2f") + "**  |  With offer ("
+                     + POUND + format(d["offer"], ".2f") + "): **+" + POUND + format(d["profit_offer"], ".2f")
+                     + "** \U0001F4B0")
+        lines.append("\U0001F91D " + cfg.OFFER_MESSAGE.replace("{offer}", POUND + format(d["offer"], ".2f")))
+    else:
+        lines.append("Profit: **+" + POUND + format(d["net_profit"], ".2f") + "** \U0001F4B0")
     if flags:
         lines.append("\U0001F3AF " + "  |  ".join(flags))
     lines.append("\U0001F50D " + cfg.CHECKLISTS.get(d["channel"], "Inspect tags and stitching carefully"))
@@ -335,7 +355,7 @@ def send_alert(d):
 # ---------------------------------------------------------------
 # daily summary (stored in stats.json)
 # ---------------------------------------------------------------
-STAT_KEYS = ["checked", "kids", "brand_mismatch", "condition_flags", "junk_or_size",
+STAT_KEYS = ["checked", "kids", "brand_mismatch", "keyword_missing", "condition_flags", "junk_or_size",
              "seller_filtered", "price_out_of_range", "low_profit", "qualified", "sent", "errors"]
 
 
@@ -360,6 +380,8 @@ def maybe_send_daily_summary(day_stats):
         "Too expensive: " + str(g("price_out_of_range", 0)) + ", profit too low: " + str(g("low_profit", 0)),
         "Deals found: " + str(g("qualified", 0)) + ", alerts sent: " + str(g("sent", 0)),
     ]
+    if g("keyword_missing", 0):
+        lines.append("Skipped (not vintage): " + str(g("keyword_missing", 0)))
     if g("errors", 0):
         lines.append("Listings that errored and were skipped: " + str(g("errors", 0)))
     if g("best_title"):
@@ -403,6 +425,7 @@ def run():
         channel, kind = t["channel"], t.get("kind")
         must_match = t.get("must_match")
         misspelled = bool(t.get("misspelled"))
+        require_any = t.get("require_any")
 
         print("\n[SEARCH] " + query)
         searches_total += 1
@@ -446,6 +469,12 @@ def run():
                 if must_match and not any(m in title.lower() for m in must_match):
                     continue
 
+                # vintage-only searches: listing must mention one of the words
+                if require_any and not any(w in text.lower() for w in require_any):
+                    stats["keyword_missing"] += 1
+                    seen.add(item_id)
+                    continue
+
                 if is_kids(title, size_title):
                     stats["kids"] += 1
                     seen.add(item_id)
@@ -483,7 +512,8 @@ def run():
                     max_buy = max_buy * cfg.RARE_MAX_BUY_MULTIPLIER
                     need_profit, need_roi = cfg.RARE_MIN_NET_PROFIT, cfg.RARE_MIN_ROI
                 else:
-                    need_profit, need_roi = cfg.MIN_NET_PROFIT, cfg.MIN_ROI
+                    need_profit = cfg.MIN_PROFIT_BY_CHANNEL.get(channel, cfg.MIN_NET_PROFIT)
+                    need_roi = cfg.ROI_BY_CHANNEL.get(channel, cfg.MIN_ROI)
 
                 if not (min_buy <= price <= max_buy):
                     stats["price_out_of_range"] += 1
@@ -497,6 +527,11 @@ def run():
                     seen.add(item_id)
                     continue
 
+                offer = suggest_offer(price)
+                profit_offer = None
+                if offer is not None:
+                    profit_offer = resell * (1 - cfg.RESELL_FEE_PCT) - offer - cfg.POSTAGE_COST
+
                 stats["qualified"] += 1
                 queued.add(item_id)
                 deals.append({
@@ -507,6 +542,7 @@ def run():
                     "misspelled": misspelled,
                     "seller_login": seller["login"], "seller_id": seller["id"],
                     "seller_deals": 1,
+                    "offer": offer, "profit_offer": profit_offer,
                 })
             except Exception as e:
                 stats["errors"] += 1
@@ -563,6 +599,7 @@ def run():
     print("Already seen (skipped):  " + str(stats["already_seen"]))
     print("Kids items blocked:      " + str(stats["kids"]))
     print("Wrong brand blocked:     " + str(stats["brand_mismatch"]))
+    print("Not vintage (skipped):   " + str(stats["keyword_missing"]))
     print("Condition red flags:     " + str(stats["condition_flags"]))
     print("Junk word / wrong size:  " + str(stats["junk_or_size"]))
     print("Seller filtered:         " + str(stats["seller_filtered"]))
