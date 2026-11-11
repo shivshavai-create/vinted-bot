@@ -22,6 +22,7 @@ BANNED_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.BANNED_WORDS)
 KIDS_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.KIDS_WORDS) + r")\b", re.I)
 KIDS_SIZE_RE = re.compile(r"\b\d+\s*(?:-\s*\d+\s*)?(?:y|yr|yrs|year|years|month|months|cm)\b", re.I)
 RED_FLAG_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.RED_FLAG_WORDS) + r")\b", re.I)
+VINTAGE_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.WORKWEAR_VINTAGE_WORDS) + r")\b", re.I)
 NEGATION_RE = re.compile(r"\b(no|without|not|nothing|zero|never|nor|free of|free from)\b[^.!?\n]{0,25}$", re.I)
 
 
@@ -261,6 +262,11 @@ def apply_tier(channel, title, resell, max_buy):
     return resell, max_buy, None
 
 
+def find_vintage(text):
+    m = VINTAGE_RE.search(text)
+    return m.group(1).lower() if m else None
+
+
 def find_rare(channel, text):
     low = text.lower()
     for w in cfg.RARE_WORDS.get(channel, []):
@@ -318,6 +324,8 @@ def post_text(channel, text):
 
 def send_alert(d):
     flags = []
+    if d.get("era_note"):
+        flags.append(d["era_note"])
     if d["tier_word"]:
         flags.append("MODEL: " + d["tier_word"])
     if d["rare_word"]:
@@ -506,6 +514,19 @@ def run():
                     continue
 
                 resell, max_buy, tier_word = apply_tier(channel, title, base_resell, base_max)
+
+                # vintage vs modern pricing (Carhartt + Dickies only)
+                era_note = None
+                if channel in cfg.MODERN_RESELL_FACTOR:
+                    vintage_word = find_vintage(text)
+                    if vintage_word:
+                        era_note = "VINTAGE: " + vintage_word
+                    else:
+                        factor = cfg.MODERN_RESELL_FACTOR[channel]
+                        resell = resell * factor
+                        max_buy = cfg.max_buy_for(resell, channel)
+                        era_note = "MODERN: resell cut to " + str(int(round(factor * 100))) + "%"
+
                 rare_word = find_rare(channel, text)
 
                 if rare_word:
@@ -543,6 +564,7 @@ def run():
                     "seller_login": seller["login"], "seller_id": seller["id"],
                     "seller_deals": 1,
                     "offer": offer, "profit_offer": profit_offer,
+                    "era_note": era_note,
                 })
             except Exception as e:
                 stats["errors"] += 1
