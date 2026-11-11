@@ -94,6 +94,19 @@ RED_FLAG_WORDS = [
 ]
 
 # ---------------------------------------------------------------
+# VINTAGE vs MODERN (Carhartt + Dickies only)
+# If the title or description contains ANY of these words, the item counts
+# as vintage and keeps the normal resell price.
+# Anything else counts as modern: its resell price is multiplied by the
+# factor below (0.5 = half price), and max buy is recalculated.
+# ---------------------------------------------------------------
+WORKWEAR_VINTAGE_WORDS = [
+    "vintage", "70s", "80s", "90s", "1970s", "1980s", "1990s",
+    "y2k", "retro", "old school", "made in usa", "usa made",
+]
+MODERN_RESELL_FACTOR = {"carhartt": 0.5, "dickies": 0.5}
+
+# ---------------------------------------------------------------
 # SIZES
 # ---------------------------------------------------------------
 TOPS = {"m", "medium", "l", "large", "xl"}
@@ -112,7 +125,7 @@ BANNED_WORDS = [
 BANNED_PHRASES = ["camo tree", "fair condition", "heavy wear", "spare or repair"]
 
 EXTRA_BANNED_BY_CHANNEL = {
-    "ralph_lauren": ["faded"],
+    "ralph_lauren": ["faded", "polo sport", "polo sports", "polosport", "polo-sport"],
 }
 
 KIDS_WORDS = [
@@ -144,7 +157,6 @@ MODEL_TIERS = {
         {"words": ["eisenhower"], "resell": 38},
     ],
     "ralph_lauren": [
-        {"words": ["polo sport"], "resell": 45},
         {"words": ["rugby"], "resell": 38},
         {"words": ["harrington"], "resell": 48},
         {"words": ["bear"], "resell": 35},
@@ -207,7 +219,6 @@ TARGETS = [
     _t("ralph lauren knit", 20, "ralph_lauren", "tops"),
     _t("ralph lauren cable knit jumper", 20, "ralph_lauren", "tops"),
     # vintage / unchanged normal prices
-    _t("polo sport ralph lauren", 35, "ralph_lauren", "tops", max_buy=14),
     _t("ralph lauren rugby shirt", 30, "ralph_lauren", "tops", max_buy=10),
     _t("ralph lauren quarter zip", 26, "ralph_lauren", "tops", max_buy=7),
     _t("ralph lauren harrington jacket", 42, "ralph_lauren", "tops", max_buy=20),
