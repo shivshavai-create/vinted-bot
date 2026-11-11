@@ -34,6 +34,8 @@ jobs:
         env:
           DISCORD_WEBHOOK_CARHARTT: ${{ secrets.DISCORD_WEBHOOK_CARHARTT }}
           DISCORD_WEBHOOK_RALPHLAUREN: ${{ secrets.DISCORD_WEBHOOK_RALPHLAUREN }}
+          DISCORD_WEBHOOK_STUSSY: ${{ secrets.DISCORD_WEBHOOK_STUSSY }}
+          DISCORD_WEBHOOK_NIKE: ${{ secrets.DISCORD_WEBHOOK_NIKE }}
         run: python main.py
 
       - name: Save seen items and stats
