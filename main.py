@@ -138,6 +138,8 @@ def validate_config():
             errors.append(label + " uses unknown channel '" + str(t["channel"]) + "'")
         if t.get("kind") not in VALID_KINDS:
             errors.append(label + " has invalid kind '" + str(t.get("kind")) + "' (use tops, bottoms, shoes)")
+        if "alert_under" in t and to_float(t["alert_under"]) is None:
+            errors.append(label + " has an alert_under that is not a number")
         if max_buy >= resell:
             warnings.append(label + ": max_buy is not below resell, it can never profit")
         t_min_buy = to_float(t.get("min_buy", cfg.MIN_BUY_PRICE))
@@ -326,6 +328,9 @@ def send_alert(d):
     flags = []
     if d.get("era_note"):
         flags.append(d["era_note"])
+    if d.get("alert_under") is not None:
+        flags.append("ALERT RULE: " + POUND + format(float(d["alert_under"]), ".0f")
+                     + " or less, profit rules skipped")
     if d["tier_word"]:
         flags.append("MODEL: " + d["tier_word"])
     if d["rare_word"]:
@@ -363,7 +368,7 @@ def send_alert(d):
 # ---------------------------------------------------------------
 # daily summary (stored in stats.json)
 # ---------------------------------------------------------------
-STAT_KEYS = ["checked", "kids", "brand_mismatch", "keyword_missing", "condition_flags", "junk_or_size",
+STAT_KEYS = ["checked", "kids", "brand_mismatch", "modern_skipped", "condition_flags", "junk_or_size",
              "seller_filtered", "price_out_of_range", "low_profit", "qualified", "sent", "errors"]
 
 
@@ -388,8 +393,8 @@ def maybe_send_daily_summary(day_stats):
         "Too expensive: " + str(g("price_out_of_range", 0)) + ", profit too low: " + str(g("low_profit", 0)),
         "Deals found: " + str(g("qualified", 0)) + ", alerts sent: " + str(g("sent", 0)),
     ]
-    if g("keyword_missing", 0):
-        lines.append("Skipped (not vintage): " + str(g("keyword_missing", 0)))
+    if g("modern_skipped", 0):
+        lines.append("Modern items skipped (no_modern searches): " + str(g("modern_skipped", 0)))
     if g("errors", 0):
         lines.append("Listings that errored and were skipped: " + str(g("errors", 0)))
     if g("best_title"):
@@ -433,7 +438,6 @@ def run():
         channel, kind = t["channel"], t.get("kind")
         must_match = t.get("must_match")
         misspelled = bool(t.get("misspelled"))
-        require_any = t.get("require_any")
 
         print("\n[SEARCH] " + query)
         searches_total += 1
@@ -477,12 +481,6 @@ def run():
                 if must_match and not any(m in title.lower() for m in must_match):
                     continue
 
-                # vintage-only searches: listing must mention one of the words
-                if require_any and not any(w in text.lower() for w in require_any):
-                    stats["keyword_missing"] += 1
-                    seen.add(item_id)
-                    continue
-
                 if is_kids(title, size_title):
                     stats["kids"] += 1
                     seen.add(item_id)
@@ -517,19 +515,36 @@ def run():
 
                 # vintage vs modern pricing (Carhartt + Dickies only)
                 era_note = None
+                is_modern = False
                 if channel in cfg.MODERN_RESELL_FACTOR:
                     vintage_word = find_vintage(text)
                     if vintage_word:
+                        v_factor = cfg.VINTAGE_RESELL_FACTOR.get(channel, 1.0)
+                        if v_factor != 1.0:
+                            resell = resell * v_factor
+                            max_buy = cfg.max_buy_for(resell, channel)
                         era_note = "VINTAGE: " + vintage_word
+                        if v_factor != 1.0:
+                            era_note += ", resell at " + str(int(round(v_factor * 100))) + "%"
                     else:
+                        is_modern = True
                         factor = cfg.MODERN_RESELL_FACTOR[channel]
                         resell = resell * factor
                         max_buy = cfg.max_buy_for(resell, channel)
                         era_note = "MODERN: resell cut to " + str(int(round(factor * 100))) + "%"
 
+                if is_modern and t.get("no_modern"):
+                    stats["modern_skipped"] += 1
+                    seen.add(item_id)
+                    continue
+
                 rare_word = find_rare(channel, text)
 
-                if rare_word:
+                alert_under = t.get("alert_under")
+                if alert_under is not None:
+                    max_buy = float(alert_under)
+                    need_profit, need_roi = None, None
+                elif rare_word:
                     max_buy = max_buy * cfg.RARE_MAX_BUY_MULTIPLIER
                     need_profit, need_roi = cfg.RARE_MIN_NET_PROFIT, cfg.RARE_MIN_ROI
                 else:
@@ -542,7 +557,7 @@ def run():
                     continue
 
                 net_profit = resell * (1 - cfg.RESELL_FEE_PCT) - price - cfg.POSTAGE_COST
-                if net_profit < need_profit or net_profit < price * need_roi:
+                if need_profit is not None and (net_profit < need_profit or net_profit < price * need_roi):
                     stats["low_profit"] += 1
                     near_misses.append((net_profit, title, price))
                     seen.add(item_id)
@@ -564,7 +579,7 @@ def run():
                     "seller_login": seller["login"], "seller_id": seller["id"],
                     "seller_deals": 1,
                     "offer": offer, "profit_offer": profit_offer,
-                    "era_note": era_note,
+                    "era_note": era_note, "alert_under": alert_under,
                 })
             except Exception as e:
                 stats["errors"] += 1
@@ -621,7 +636,7 @@ def run():
     print("Already seen (skipped):  " + str(stats["already_seen"]))
     print("Kids items blocked:      " + str(stats["kids"]))
     print("Wrong brand blocked:     " + str(stats["brand_mismatch"]))
-    print("Not vintage (skipped):   " + str(stats["keyword_missing"]))
+    print("Modern items skipped:    " + str(stats["modern_skipped"]))
     print("Condition red flags:     " + str(stats["condition_flags"]))
     print("Junk word / wrong size:  " + str(stats["junk_or_size"]))
     print("Seller filtered:         " + str(stats["seller_filtered"]))
