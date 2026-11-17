@@ -23,6 +23,7 @@ KIDS_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.KIDS_WORDS) + r
 KIDS_SIZE_RE = re.compile(r"\b\d+\s*(?:-\s*\d+\s*)?(?:y|yr|yrs|year|years|month|months|cm)\b", re.I)
 RED_FLAG_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.RED_FLAG_WORDS) + r")\b", re.I)
 VINTAGE_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.WORKWEAR_VINTAGE_WORDS) + r")\b", re.I)
+AUTH_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.AUTHENTIC_WORDS) + r")\b", re.I)
 NEGATION_RE = re.compile(r"\b(no|without|not|nothing|zero|never|nor|free of|free from)\b[^.!?\n]{0,25}$", re.I)
 
 
@@ -269,6 +270,21 @@ def find_vintage(text):
     return m.group(1).lower() if m else None
 
 
+def find_authentic(text):
+    """Returns the 'authentic/real' word a seller used, ignoring 'not authentic', 'no real' etc."""
+    for m in AUTH_RE.finditer(text):
+        prefix = text[max(0, m.start() - 30): m.start()]
+        if NEGATION_RE.search(prefix):
+            continue
+        return m.group(1).lower()
+    return None
+
+
+def has_any_word(text, words):
+    pattern = r"\b(" + "|".join(re.escape(w) for w in words) + r")\b"
+    return bool(re.search(pattern, text, re.I))
+
+
 def find_rare(channel, text):
     low = text.lower()
     for w in cfg.RARE_WORDS.get(channel, []):
@@ -331,6 +347,8 @@ def send_alert(d):
     if d.get("alert_under") is not None:
         flags.append("ALERT RULE: " + POUND + format(float(d["alert_under"]), ".0f")
                      + " or less, profit rules skipped")
+    if d.get("auth_word"):
+        flags.append("SELLER SAYS: " + d["auth_word"] + " (a claim only, still verify)")
     if d["tier_word"]:
         flags.append("MODEL: " + d["tier_word"])
     if d["rare_word"]:
@@ -368,7 +386,7 @@ def send_alert(d):
 # ---------------------------------------------------------------
 # daily summary (stored in stats.json)
 # ---------------------------------------------------------------
-STAT_KEYS = ["checked", "kids", "brand_mismatch", "modern_skipped", "condition_flags", "junk_or_size",
+STAT_KEYS = ["checked", "kids", "brand_mismatch", "keyword_missing", "modern_skipped", "condition_flags", "junk_or_size",
              "seller_filtered", "price_out_of_range", "low_profit", "qualified", "sent", "errors"]
 
 
@@ -393,6 +411,8 @@ def maybe_send_daily_summary(day_stats):
         "Too expensive: " + str(g("price_out_of_range", 0)) + ", profit too low: " + str(g("low_profit", 0)),
         "Deals found: " + str(g("qualified", 0)) + ", alerts sent: " + str(g("sent", 0)),
     ]
+    if g("keyword_missing", 0):
+        lines.append("Skipped (not the wanted type, e.g. NF non-puffers): " + str(g("keyword_missing", 0)))
     if g("modern_skipped", 0):
         lines.append("Modern items skipped (no_modern searches): " + str(g("modern_skipped", 0)))
     if g("errors", 0):
@@ -438,6 +458,8 @@ def run():
         channel, kind = t["channel"], t.get("kind")
         must_match = t.get("must_match")
         misspelled = bool(t.get("misspelled"))
+        require_any = t.get("require_any")
+        max_items = int(t.get("items", cfg.ITEMS_PER_SEARCH))
 
         print("\n[SEARCH] " + query)
         searches_total += 1
@@ -454,7 +476,7 @@ def run():
             print("[DEBUG] seller fields: " + ", ".join(describe_fields(field(items[0], "user"))))
             debug_printed = True
 
-        for item in items[: cfg.ITEMS_PER_SEARCH]:
+        for item in items[:max_items]:
             try:
                 item_id = str(field(item, "id", ""))
                 if not item_id or item_id == "None" or item_id in queued:
@@ -479,6 +501,12 @@ def run():
 
                 # misspelling searches: the title must really contain the misspelling
                 if must_match and not any(m in title.lower() for m in must_match):
+                    continue
+
+                # wanted-type searches (e.g. North Face PUFFERS only)
+                if require_any and not has_any_word(text, require_any):
+                    stats["keyword_missing"] += 1
+                    seen.add(item_id)
                     continue
 
                 if is_kids(title, size_title):
@@ -539,6 +567,9 @@ def run():
                     continue
 
                 rare_word = find_rare(channel, text)
+                auth_word = None
+                if channel in cfg.AUTHENTIC_BONUS_CHANNELS:
+                    auth_word = find_authentic(text)
 
                 alert_under = t.get("alert_under")
                 if alert_under is not None:
@@ -550,6 +581,11 @@ def run():
                 else:
                     need_profit = cfg.MIN_PROFIT_BY_CHANNEL.get(channel, cfg.MIN_NET_PROFIT)
                     need_roi = cfg.ROI_BY_CHANNEL.get(channel, cfg.MIN_ROI)
+
+                if auth_word and alert_under is None:
+                    max_buy = max_buy * cfg.AUTHENTIC_MAX_BUY_MULTIPLIER
+                    need_profit = min(need_profit, cfg.RARE_MIN_NET_PROFIT)
+                    need_roi = min(need_roi, cfg.RARE_MIN_ROI)
 
                 if not (min_buy <= price <= max_buy):
                     stats["price_out_of_range"] += 1
@@ -579,7 +615,7 @@ def run():
                     "seller_login": seller["login"], "seller_id": seller["id"],
                     "seller_deals": 1,
                     "offer": offer, "profit_offer": profit_offer,
-                    "era_note": era_note, "alert_under": alert_under,
+                    "era_note": era_note, "alert_under": alert_under, "auth_word": auth_word,
                 })
             except Exception as e:
                 stats["errors"] += 1
@@ -607,8 +643,20 @@ def run():
         if key:
             d["seller_deals"] = per_seller[key]
 
-    deals.sort(key=lambda d: d["net_profit"], reverse=True)
-    to_send = deals[: cfg.MAX_ALERTS_PER_RUN]
+    def rank(d):
+        return d["net_profit"] + (cfg.AUTHENTIC_RANK_BONUS if d.get("auth_word") else 0.0)
+
+    deals.sort(key=rank, reverse=True)
+    to_send = []
+    per_channel = {}
+    for d in deals:
+        if len(to_send) >= cfg.MAX_ALERTS_PER_RUN:
+            break
+        limit = cfg.MAX_ALERTS_BY_CHANNEL.get(d["channel"], cfg.MAX_ALERTS_PER_CHANNEL)
+        if per_channel.get(d["channel"], 0) >= limit:
+            continue
+        per_channel[d["channel"]] = per_channel.get(d["channel"], 0) + 1
+        to_send.append(d)
 
     sent = 0
     for d in to_send:
@@ -636,6 +684,7 @@ def run():
     print("Already seen (skipped):  " + str(stats["already_seen"]))
     print("Kids items blocked:      " + str(stats["kids"]))
     print("Wrong brand blocked:     " + str(stats["brand_mismatch"]))
+    print("Not the wanted type:     " + str(stats["keyword_missing"]))
     print("Modern items skipped:    " + str(stats["modern_skipped"]))
     print("Condition red flags:     " + str(stats["condition_flags"]))
     print("Junk word / wrong size:  " + str(stats["junk_or_size"]))
