@@ -12,9 +12,11 @@ import config as cfg
 
 BASE_URL = "https://www.vinted.co.uk"
 SEEN_FILE = "seen.json"
+ALERTED_FILE = "alerted.json"
 STATS_FILE = "stats.json"
 VALID_KINDS = {"tops", "bottoms", "shoes", None}
 POUND = "\u00a3"
+START_TIME = time.time()
 
 scraper = VintedScraper(BASE_URL)
 
@@ -30,18 +32,15 @@ NEGATION_RE = re.compile(r"\b(no|without|not|nothing|zero|never|nor|free of|free
 # ---------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------
-def load_json(path, default):
+def read_json(path):
     try:
         with open(path) as f:
-            data = json.load(f)
-        if isinstance(data, type(default)):
-            return data
-        return default
+            return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return default
+        return None
 
 
-def save_json(path, data):
+def write_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f)
 
@@ -114,6 +113,69 @@ def search_with_retry(query):
 
 
 # ---------------------------------------------------------------
+# state: what has been checked and what has been alerted
+# ---------------------------------------------------------------
+def parse_day(s):
+    try:
+        return datetime.date.fromisoformat(str(s))
+    except (ValueError, TypeError):
+        return None
+
+
+def prune_old(mapping, today_str, days):
+    today = datetime.date.fromisoformat(today_str)
+    keep = {}
+    for k, v in mapping.items():
+        d = parse_day(v)
+        if d is None:
+            keep[k] = today_str
+        elif (today - d).days <= days:
+            keep[k] = v
+    return keep
+
+
+def load_state(today):
+    raw_seen = read_json(SEEN_FILE)
+    if isinstance(raw_seen, dict):
+        seen = {str(k): str(v) for k, v in raw_seen.items()}
+    elif isinstance(raw_seen, list):          # old format: a plain list of ids
+        seen = {str(x): today for x in raw_seen}
+    else:
+        seen = {}
+
+    alerted = {"ids": {}, "fps": {}}
+    raw_al = read_json(ALERTED_FILE)
+    if isinstance(raw_al, dict):
+        for key in ("ids", "fps"):
+            if isinstance(raw_al.get(key), dict):
+                alerted[key] = {str(k): str(v) for k, v in raw_al[key].items()}
+
+    day = read_json(STATS_FILE)
+    if not isinstance(day, dict):
+        day = {}
+
+    seen = prune_old(seen, today, cfg.SEEN_RETENTION_DAYS)
+    alerted["ids"] = prune_old(alerted["ids"], today, cfg.ALERTED_ID_RETENTION_DAYS)
+    alerted["fps"] = prune_old(alerted["fps"], today, cfg.ALERTED_RELIST_RETENTION_DAYS)
+    return seen, alerted, day
+
+
+def save_state(seen, alerted, day):
+    write_json(SEEN_FILE, seen)
+    write_json(ALERTED_FILE, alerted)
+    write_json(STATS_FILE, day)
+
+
+def make_fp(seller, title):
+    """Same seller + same title = the same item relisted."""
+    who = seller.get("id") or seller.get("login")
+    if not who:
+        return None
+    words = re.findall(r"\w+", title.lower())
+    return str(who) + "|" + " ".join(words)[:120]
+
+
+# ---------------------------------------------------------------
 # config validation (clear errors instead of mystery crashes)
 # ---------------------------------------------------------------
 def validate_config():
@@ -141,11 +203,14 @@ def validate_config():
             errors.append(label + " has invalid kind '" + str(t.get("kind")) + "' (use tops, bottoms, shoes)")
         if "alert_under" in t and to_float(t["alert_under"]) is None:
             errors.append(label + " has an alert_under that is not a number")
+        if "postage" in t and to_float(t["postage"]) is None:
+            errors.append(label + " has a postage that is not a number")
         if max_buy >= resell:
             warnings.append(label + ": max_buy is not below resell, it can never profit")
         t_min_buy = to_float(t.get("min_buy", cfg.MIN_BUY_PRICE))
-        if t["channel"] in cfg.ENABLED_CHANNELS and t_min_buy is not None and max_buy < t_min_buy:
-            warnings.append(label + ": max_buy is below the minimum buy price, it can never alert")
+        if (t["channel"] in cfg.ENABLED_CHANNELS and t_min_buy is not None and max_buy < t_min_buy
+                and not cfg.MODEL_TIERS.get(t["channel"])):
+            warnings.append(label + ": max_buy is below the minimum buy price (tiers may still raise it)")
 
     for ch in sorted(cfg.ENABLED_CHANNELS):
         if not cfg.get_webhook(ch):
@@ -195,6 +260,11 @@ def find_red_flag(text):
             continue
         return m.group(1).lower()
     return None
+
+
+def has_any_word(text, words):
+    pattern = r"\b(" + "|".join(re.escape(w) for w in words) + r")\b"
+    return bool(re.search(pattern, text, re.I))
 
 
 def size_ok(kind, size_title, text):
@@ -250,17 +320,21 @@ def seller_ok(seller):
 
 
 # ---------------------------------------------------------------
-# tiers, rare words, sold link
+# tiers (model recognition), rare words, authentic claims, sold link
 # ---------------------------------------------------------------
-def apply_tier(channel, title, resell, max_buy):
+def apply_tier(channel, title, resell, max_buy, postage):
+    """The most SPECIFIC matching model word wins; a tier only ever raises the price."""
     low = title.lower()
-    best = None
+    best, best_spec = None, -1
     for tier in cfg.MODEL_TIERS.get(channel, []):
-        if any(w in low for w in tier["words"]):
-            if best is None or tier["resell"] > best["resell"]:
-                best = tier
+        matched = [w for w in tier["words"] if w in low]
+        if not matched:
+            continue
+        spec = max(len(w) for w in matched)
+        if spec > best_spec or (spec == best_spec and best is not None and tier["resell"] > best["resell"]):
+            best, best_spec = tier, spec
     if best and float(best["resell"]) > resell:
-        tier_max = best.get("max_buy") or cfg.max_buy_for(float(best["resell"]), channel)
+        tier_max = best.get("max_buy") or cfg.max_buy_for(float(best["resell"]), channel, postage)
         return float(best["resell"]), max(max_buy, float(tier_max)), best["words"][0]
     return resell, max_buy, None
 
@@ -271,18 +345,12 @@ def find_vintage(text):
 
 
 def find_authentic(text):
-    """Returns the 'authentic/real' word a seller used, ignoring 'not authentic', 'no real' etc."""
     for m in AUTH_RE.finditer(text):
         prefix = text[max(0, m.start() - 30): m.start()]
         if NEGATION_RE.search(prefix):
             continue
         return m.group(1).lower()
     return None
-
-
-def has_any_word(text, words):
-    pattern = r"\b(" + "|".join(re.escape(w) for w in words) + r")\b"
-    return bool(re.search(pattern, text, re.I))
 
 
 def find_rare(channel, text):
@@ -353,6 +421,9 @@ def send_alert(d):
         flags.append("MODEL: " + d["tier_word"])
     if d["rare_word"]:
         flags.append("RARE: " + d["rare_word"])
+    if d["resell"] > 0 and d["price"] <= d["resell"] * 0.5:
+        flags.append("UNDERPRICED: asking " + str(int(round(100 * d["price"] / d["resell"])))
+                     + "% of my resell estimate")
     if d["misspelled"]:
         flags.append("MISSPELLED LISTING - double check it is genuine")
     if d["seller_deals"] > 1:
@@ -386,7 +457,8 @@ def send_alert(d):
 # ---------------------------------------------------------------
 # daily summary (stored in stats.json)
 # ---------------------------------------------------------------
-STAT_KEYS = ["checked", "kids", "brand_mismatch", "keyword_missing", "modern_skipped", "condition_flags", "junk_or_size",
+STAT_KEYS = ["checked", "already_alerted", "relist_blocked", "kids", "brand_mismatch",
+             "keyword_missing", "modern_skipped", "condition_flags", "junk_or_size",
              "seller_filtered", "price_out_of_range", "low_profit", "qualified", "sent", "errors"]
 
 
@@ -408,6 +480,8 @@ def maybe_send_daily_summary(day_stats):
         "Blocked: kids " + str(g("kids", 0)) + ", wrong brand " + str(g("brand_mismatch", 0))
         + ", condition " + str(g("condition_flags", 0)) + ", junk/size " + str(g("junk_or_size", 0))
         + ", sellers " + str(g("seller_filtered", 0)),
+        "Repeat protection: already alerted " + str(g("already_alerted", 0))
+        + ", relists blocked " + str(g("relist_blocked", 0)),
         "Too expensive: " + str(g("price_out_of_range", 0)) + ", profit too low: " + str(g("low_profit", 0)),
         "Deals found: " + str(g("qualified", 0)) + ", alerts sent: " + str(g("sent", 0)),
     ]
@@ -431,15 +505,19 @@ def maybe_send_daily_summary(day_stats):
 def run():
     validate_config()
 
-    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-    day = load_json(STATS_FILE, {})
+    now = datetime.datetime.now(datetime.timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    seen, alerted, day = load_state(today)
     if day.get("day") != today:
         maybe_send_daily_summary(day)
         day = new_day_stats(today)
 
-    seen = set(str(x) for x in load_json(SEEN_FILE, []))
+    print("[STATE] checked-before: " + str(len(seen)) + " | alerted ids: " + str(len(alerted["ids"]))
+          + " | alerted relist fingerprints: " + str(len(alerted["fps"])))
+
     deals = []
     queued = set()
+    queued_fps = set()
     near_misses = []
     stats = {k: 0 for k in STAT_KEYS}
     stats["already_seen"] = 0
@@ -448,260 +526,291 @@ def run():
     searches_with_results = 0
     debug_printed = False
 
-    for t in cfg.TARGETS:
-        if t["channel"] not in cfg.ENABLED_CHANNELS:
-            continue
+    for ch in sorted(cfg.ENABLED_CHANNELS):
+        found = "yes" if cfg.get_webhook(ch) else "NO - secret missing or name mismatch"
+        print("[CHECK] Webhook for " + ch + ": " + found)
 
-        query = t["query"]
-        base_resell, base_max = float(t["resell"]), float(t["max_buy"])
-        min_buy = float(t.get("min_buy", cfg.MIN_BUY_PRICE))
-        channel, kind = t["channel"], t.get("kind")
-        must_match = t.get("must_match")
-        misspelled = bool(t.get("misspelled"))
-        require_any = t.get("require_any")
-        max_items = int(t.get("items", cfg.ITEMS_PER_SEARCH))
+    # rotate the start point every hour so, if time runs short, different searches get skipped
+    targets = [t for t in cfg.TARGETS if t["channel"] in cfg.ENABLED_CHANNELS]
+    if targets:
+        offset = (now.hour * 11) % len(targets)
+        targets = targets[offset:] + targets[:offset]
 
-        print("\n[SEARCH] " + query)
-        searches_total += 1
-        items = search_with_retry(query)
+    try:
+        for t in targets:
+            if time.time() - START_TIME > cfg.TIME_BUDGET_SECONDS:
+                print("[WARN] Time budget reached, skipping the remaining searches (state is saved).")
+                break
 
-        if not items:
-            print("[WARN] 0 items (possible block or empty search)")
-            time.sleep(3)
-            continue
-        searches_with_results += 1
+            query = t["query"]
+            base_resell, base_max = float(t["resell"]), float(t["max_buy"])
+            min_buy = float(t.get("min_buy", cfg.MIN_BUY_PRICE))
+            channel, kind = t["channel"], t.get("kind")
+            postage = float(t.get("postage", cfg.POSTAGE_BY_CHANNEL.get(channel, cfg.POSTAGE_COST)))
+            must_match = t.get("must_match")
+            misspelled = bool(t.get("misspelled"))
+            require_any = t.get("require_any")
+            max_items = int(t.get("items", cfg.ITEMS_PER_SEARCH))
 
-        if not debug_printed:
-            print("[DEBUG] listing fields: " + ", ".join(describe_fields(items[0])))
-            print("[DEBUG] seller fields: " + ", ".join(describe_fields(field(items[0], "user"))))
-            debug_printed = True
+            print("\n[SEARCH] " + query)
+            searches_total += 1
+            items = search_with_retry(query)
 
-        for item in items[:max_items]:
-            try:
-                item_id = str(field(item, "id", ""))
-                if not item_id or item_id == "None" or item_id in queued:
-                    continue
+            if not items:
+                print("[WARN] 0 items (possible block or empty search)")
+                time.sleep(3)
+                continue
+            searches_with_results += 1
 
-                stats["checked"] += 1
-                if item_id in seen:
-                    stats["already_seen"] += 1
-                    continue
+            if not debug_printed:
+                print("[DEBUG] listing fields: " + ", ".join(describe_fields(items[0])))
+                print("[DEBUG] seller fields: " + ", ".join(describe_fields(field(items[0], "user"))))
+                debug_printed = True
 
-                title = str(field(item, "title", "Unknown") or "Unknown")
-                desc = str(field(item, "description", "") or "")
-                brand_field = str(field(item, "brand_title", "") or "")
-                text = title + " " + desc
-                price = parse_price(field(item, "price"))
-                size_title = field(item, "size_title")
-                if size_title is not None:
-                    size_title = str(size_title)
+            for item in items[:max_items]:
+                try:
+                    item_id = str(field(item, "id", ""))
+                    if not item_id or item_id == "None" or item_id in queued:
+                        continue
 
-                if price is None:
-                    continue
+                    stats["checked"] += 1
+                    if item_id in alerted["ids"]:
+                        stats["already_alerted"] += 1
+                        continue
+                    if item_id in seen:
+                        seen[item_id] = today          # still listed: keep remembering it
+                        stats["already_seen"] += 1
+                        continue
 
-                # misspelling searches: the title must really contain the misspelling
-                if must_match and not any(m in title.lower() for m in must_match):
-                    continue
+                    title = str(field(item, "title", "Unknown") or "Unknown")
+                    desc = str(field(item, "description", "") or "")
+                    brand_field = str(field(item, "brand_title", "") or "")
+                    text = title + " " + desc
+                    price = parse_price(field(item, "price"))
+                    size_title = field(item, "size_title")
+                    if size_title is not None:
+                        size_title = str(size_title)
 
-                # wanted-type searches (e.g. North Face PUFFERS only)
-                if require_any and not has_any_word(text, require_any):
-                    stats["keyword_missing"] += 1
-                    seen.add(item_id)
-                    continue
+                    if price is None:
+                        continue
 
-                if is_kids(title, size_title):
-                    stats["kids"] += 1
-                    seen.add(item_id)
-                    continue
+                    if must_match and not any(m in title.lower() for m in must_match):
+                        continue
 
-                # NEW FILTER 1: brand check
-                if cfg.BRAND_CHECK_ENABLED and not misspelled and not brand_ok(channel, text + " " + brand_field):
-                    stats["brand_mismatch"] += 1
-                    seen.add(item_id)
-                    continue
+                    if require_any and not has_any_word(text, require_any):
+                        stats["keyword_missing"] += 1
+                        seen[item_id] = today
+                        continue
 
-                # NEW FILTER 2: condition red flags
-                if cfg.CONDITION_CHECK_ENABLED and find_red_flag(text):
-                    stats["condition_flags"] += 1
-                    seen.add(item_id)
-                    continue
+                    if is_kids(title, size_title):
+                        stats["kids"] += 1
+                        seen[item_id] = today
+                        continue
 
-                if is_banned(text, channel) or not size_ok(kind, size_title, text):
-                    stats["junk_or_size"] += 1
-                    seen.add(item_id)
-                    continue
+                    if cfg.BRAND_CHECK_ENABLED and not misspelled and not brand_ok(channel, text + " " + brand_field):
+                        stats["brand_mismatch"] += 1
+                        seen[item_id] = today
+                        continue
 
-                seller = get_seller(item)
-                if seller["rep"] is not None:
-                    stats["seller_data"] += 1
-                if not seller_ok(seller):
-                    stats["seller_filtered"] += 1
-                    seen.add(item_id)
-                    continue
+                    if cfg.CONDITION_CHECK_ENABLED and find_red_flag(text):
+                        stats["condition_flags"] += 1
+                        seen[item_id] = today
+                        continue
 
-                resell, max_buy, tier_word = apply_tier(channel, title, base_resell, base_max)
+                    if is_banned(text, channel) or not size_ok(kind, size_title, text):
+                        stats["junk_or_size"] += 1
+                        seen[item_id] = today
+                        continue
 
-                # vintage vs modern pricing (Carhartt + Dickies only)
-                era_note = None
-                is_modern = False
-                if channel in cfg.MODERN_RESELL_FACTOR:
-                    vintage_word = find_vintage(text)
-                    if vintage_word:
-                        v_factor = cfg.VINTAGE_RESELL_FACTOR.get(channel, 1.0)
-                        if v_factor != 1.0:
-                            resell = resell * v_factor
-                            max_buy = cfg.max_buy_for(resell, channel)
-                        era_note = "VINTAGE: " + vintage_word
-                        if v_factor != 1.0:
-                            era_note += ", resell at " + str(int(round(v_factor * 100))) + "%"
+                    seller = get_seller(item)
+                    if seller["rep"] is not None:
+                        stats["seller_data"] += 1
+                    if not seller_ok(seller):
+                        stats["seller_filtered"] += 1
+                        seen[item_id] = today
+                        continue
+
+                    resell, max_buy, tier_word = apply_tier(channel, title, base_resell, base_max, postage)
+
+                    # vintage vs modern pricing (Carhartt + Dickies only)
+                    era_note = None
+                    is_modern = False
+                    if channel in cfg.MODERN_RESELL_FACTOR:
+                        vintage_word = find_vintage(text)
+                        if vintage_word:
+                            v_factor = cfg.VINTAGE_RESELL_FACTOR.get(channel, 1.0)
+                            if v_factor != 1.0:
+                                resell = resell * v_factor
+                                max_buy = cfg.max_buy_for(resell, channel, postage)
+                            era_note = "VINTAGE: " + vintage_word
+                            if v_factor != 1.0:
+                                era_note += ", resell at " + str(int(round(v_factor * 100))) + "%"
+                        else:
+                            is_modern = True
+                            factor = cfg.MODERN_RESELL_FACTOR[channel]
+                            resell = resell * factor
+                            max_buy = cfg.max_buy_for(resell, channel, postage)
+                            era_note = "MODERN: resell cut to " + str(int(round(factor * 100))) + "%"
+
+                    if is_modern and t.get("no_modern"):
+                        stats["modern_skipped"] += 1
+                        seen[item_id] = today
+                        continue
+
+                    rare_word = find_rare(channel, text)
+                    auth_word = None
+                    if channel in cfg.AUTHENTIC_BONUS_CHANNELS:
+                        auth_word = find_authentic(text)
+
+                    alert_under = t.get("alert_under")
+                    if alert_under is not None:
+                        max_buy = float(alert_under)
+                        need_profit, need_roi = None, None
+                    elif rare_word:
+                        max_buy = max_buy * cfg.RARE_MAX_BUY_MULTIPLIER
+                        need_profit, need_roi = cfg.RARE_MIN_NET_PROFIT, cfg.RARE_MIN_ROI
                     else:
-                        is_modern = True
-                        factor = cfg.MODERN_RESELL_FACTOR[channel]
-                        resell = resell * factor
-                        max_buy = cfg.max_buy_for(resell, channel)
-                        era_note = "MODERN: resell cut to " + str(int(round(factor * 100))) + "%"
+                        need_profit = cfg.MIN_PROFIT_BY_CHANNEL.get(channel, cfg.MIN_NET_PROFIT)
+                        need_roi = cfg.ROI_BY_CHANNEL.get(channel, cfg.MIN_ROI)
 
-                if is_modern and t.get("no_modern"):
-                    stats["modern_skipped"] += 1
-                    seen.add(item_id)
-                    continue
+                    if auth_word and alert_under is None:
+                        max_buy = max_buy * cfg.AUTHENTIC_MAX_BUY_MULTIPLIER
+                        need_profit = min(need_profit, cfg.RARE_MIN_NET_PROFIT)
+                        need_roi = min(need_roi, cfg.RARE_MIN_ROI)
 
-                rare_word = find_rare(channel, text)
-                auth_word = None
-                if channel in cfg.AUTHENTIC_BONUS_CHANNELS:
-                    auth_word = find_authentic(text)
+                    if not (min_buy <= price <= max_buy):
+                        stats["price_out_of_range"] += 1
+                        seen[item_id] = today
+                        continue
 
-                alert_under = t.get("alert_under")
-                if alert_under is not None:
-                    max_buy = float(alert_under)
-                    need_profit, need_roi = None, None
-                elif rare_word:
-                    max_buy = max_buy * cfg.RARE_MAX_BUY_MULTIPLIER
-                    need_profit, need_roi = cfg.RARE_MIN_NET_PROFIT, cfg.RARE_MIN_ROI
-                else:
-                    need_profit = cfg.MIN_PROFIT_BY_CHANNEL.get(channel, cfg.MIN_NET_PROFIT)
-                    need_roi = cfg.ROI_BY_CHANNEL.get(channel, cfg.MIN_ROI)
+                    net_profit = resell * (1 - cfg.RESELL_FEE_PCT) - price - postage
+                    if need_profit is not None and (net_profit < need_profit or net_profit < price * need_roi):
+                        stats["low_profit"] += 1
+                        near_misses.append((net_profit, title, price))
+                        seen[item_id] = today
+                        continue
 
-                if auth_word and alert_under is None:
-                    max_buy = max_buy * cfg.AUTHENTIC_MAX_BUY_MULTIPLIER
-                    need_profit = min(need_profit, cfg.RARE_MIN_NET_PROFIT)
-                    need_roi = min(need_roi, cfg.RARE_MIN_ROI)
+                    # repeat protection: the same seller + title was already alerted (a relist)
+                    fp = make_fp(seller, title)
+                    if fp and (fp in alerted["fps"] or fp in queued_fps):
+                        stats["relist_blocked"] += 1
+                        seen[item_id] = today
+                        continue
 
-                if not (min_buy <= price <= max_buy):
-                    stats["price_out_of_range"] += 1
-                    seen.add(item_id)
-                    continue
+                    offer = suggest_offer(price)
+                    profit_offer = None
+                    if offer is not None:
+                        profit_offer = resell * (1 - cfg.RESELL_FEE_PCT) - offer - postage
 
-                net_profit = resell * (1 - cfg.RESELL_FEE_PCT) - price - cfg.POSTAGE_COST
-                if need_profit is not None and (net_profit < need_profit or net_profit < price * need_roi):
-                    stats["low_profit"] += 1
-                    near_misses.append((net_profit, title, price))
-                    seen.add(item_id)
-                    continue
+                    stats["qualified"] += 1
+                    queued.add(item_id)
+                    if fp:
+                        queued_fps.add(fp)
+                    deals.append({
+                        "id": item_id, "title": title, "price": price,
+                        "url": full_url(field(item, "url")), "resell": resell,
+                        "net_profit": net_profit, "channel": channel,
+                        "tier_word": tier_word, "rare_word": rare_word,
+                        "misspelled": misspelled,
+                        "seller_login": seller["login"], "seller_id": seller["id"],
+                        "seller_deals": 1,
+                        "offer": offer, "profit_offer": profit_offer,
+                        "era_note": era_note, "alert_under": alert_under, "auth_word": auth_word,
+                        "fp": fp,
+                    })
+                except Exception as e:
+                    stats["errors"] += 1
+                    print("[WARN] Skipped one listing because of an error: " + str(e)[:120])
 
-                offer = suggest_offer(price)
-                profit_offer = None
-                if offer is not None:
-                    profit_offer = resell * (1 - cfg.RESELL_FEE_PCT) - offer - cfg.POSTAGE_COST
+            time.sleep(3)
 
-                stats["qualified"] += 1
-                queued.add(item_id)
-                deals.append({
-                    "id": item_id, "title": title, "price": price,
-                    "url": full_url(field(item, "url")), "resell": resell,
-                    "net_profit": net_profit, "channel": channel,
-                    "tier_word": tier_word, "rare_word": rare_word,
-                    "misspelled": misspelled,
-                    "seller_login": seller["login"], "seller_id": seller["id"],
-                    "seller_deals": 1,
-                    "offer": offer, "profit_offer": profit_offer,
-                    "era_note": era_note, "alert_under": alert_under, "auth_word": auth_word,
-                })
-            except Exception as e:
-                stats["errors"] += 1
-                print("[WARN] Skipped one listing because of an error: " + str(e)[:120])
+        # health check: every search empty means Vinted is probably blocking us
+        if searches_total > 0 and searches_with_results == 0:
+            print("[ALERT] Every search returned nothing - Vinted is probably blocking this server.")
+            if not day.get("block_alerted"):
+                post_text(cfg.SUMMARY_CHANNEL,
+                          "\u26A0\uFE0F Deal Hunter: every Vinted search returned 0 results this run. "
+                          "Vinted may be blocking GitHub's servers. I will keep trying every hour.")
+                day["block_alerted"] = True
 
-        time.sleep(3)
+        # bundle tip: count deals per seller
+        per_seller = {}
+        for d in deals:
+            key = d["seller_id"] or d["seller_login"]
+            if key:
+                per_seller[key] = per_seller.get(key, 0) + 1
+        for d in deals:
+            key = d["seller_id"] or d["seller_login"]
+            if key:
+                d["seller_deals"] = per_seller[key]
 
-    # health check: every search empty means Vinted is probably blocking us
-    if searches_total > 0 and searches_with_results == 0:
-        print("[ALERT] Every search returned nothing - Vinted is probably blocking this server.")
-        if not day.get("block_alerted"):
-            post_text(cfg.SUMMARY_CHANNEL,
-                      "\u26A0\uFE0F Deal Hunter: every Vinted search returned 0 results this run. "
-                      "Vinted may be blocking GitHub's servers. I will keep trying every hour.")
-            day["block_alerted"] = True
+        def rank(d):
+            return d["net_profit"] + (cfg.AUTHENTIC_RANK_BONUS if d.get("auth_word") else 0.0)
 
-    # bundle tip: count deals per seller
-    per_seller = {}
-    for d in deals:
-        key = d["seller_id"] or d["seller_login"]
-        if key:
-            per_seller[key] = per_seller.get(key, 0) + 1
-    for d in deals:
-        key = d["seller_id"] or d["seller_login"]
-        if key:
-            d["seller_deals"] = per_seller[key]
+        deals.sort(key=rank, reverse=True)
+        to_send = []
+        per_channel = {}
+        for d in deals:
+            if len(to_send) >= cfg.MAX_ALERTS_PER_RUN:
+                break
+            limit = cfg.MAX_ALERTS_BY_CHANNEL.get(d["channel"], cfg.MAX_ALERTS_PER_CHANNEL)
+            if per_channel.get(d["channel"], 0) >= limit:
+                continue
+            per_channel[d["channel"]] = per_channel.get(d["channel"], 0) + 1
+            to_send.append(d)
 
-    def rank(d):
-        return d["net_profit"] + (cfg.AUTHENTIC_RANK_BONUS if d.get("auth_word") else 0.0)
+        sent = 0
+        for d in to_send:
+            if send_alert(d):
+                # remember it FOREVER (180 days) the moment it is sent, and save straight away
+                seen[d["id"]] = today
+                alerted["ids"][d["id"]] = today
+                if d["fp"]:
+                    alerted["fps"][d["fp"]] = today
+                save_state(seen, alerted, day)
+                sent += 1
+                if d["net_profit"] > day.get("best_profit", 0.0):
+                    day["best_profit"] = d["net_profit"]
+                    day["best_title"] = d["title"]
+            time.sleep(1)
+        stats["sent"] = sent
 
-    deals.sort(key=rank, reverse=True)
-    to_send = []
-    per_channel = {}
-    for d in deals:
-        if len(to_send) >= cfg.MAX_ALERTS_PER_RUN:
-            break
-        limit = cfg.MAX_ALERTS_BY_CHANNEL.get(d["channel"], cfg.MAX_ALERTS_PER_CHANNEL)
-        if per_channel.get(d["channel"], 0) >= limit:
-            continue
-        per_channel[d["channel"]] = per_channel.get(d["channel"], 0) + 1
-        to_send.append(d)
+        held = len(deals) - len(to_send)
+        if held > 0:
+            print("[INFO] " + str(held) + " more qualifying deals held for next run")
 
-    sent = 0
-    for d in to_send:
-        if send_alert(d):
-            seen.add(d["id"])
-            sent += 1
-            if d["net_profit"] > day.get("best_profit", 0.0):
-                day["best_profit"] = d["net_profit"]
-                day["best_title"] = d["title"]
-        time.sleep(1)
-    stats["sent"] = sent
+        day["runs"] = day.get("runs", 0) + 1
+        for k in STAT_KEYS:
+            day[k] = day.get(k, 0) + stats[k]
 
-    held = len(deals) - len(to_send)
-    if held > 0:
-        print("[INFO] " + str(held) + " more qualifying deals held for next run")
+        print("\n===== SUMMARY =====")
+        print("Listings checked:        " + str(stats["checked"]))
+        print("Already alerted (blocked): " + str(stats["already_alerted"]))
+        print("Relists blocked:         " + str(stats["relist_blocked"]))
+        print("Already seen (skipped):  " + str(stats["already_seen"]))
+        print("Kids items blocked:      " + str(stats["kids"]))
+        print("Wrong brand blocked:     " + str(stats["brand_mismatch"]))
+        print("Not the wanted type:     " + str(stats["keyword_missing"]))
+        print("Modern items skipped:    " + str(stats["modern_skipped"]))
+        print("Condition red flags:     " + str(stats["condition_flags"]))
+        print("Junk word / wrong size:  " + str(stats["junk_or_size"]))
+        print("Seller filtered:         " + str(stats["seller_filtered"]))
+        print("Price out of range:      " + str(stats["price_out_of_range"]))
+        print("Profit too low:          " + str(stats["low_profit"]))
+        print("Qualified deals:         " + str(stats["qualified"]))
+        print("Alerts sent to Discord:  " + str(stats["sent"]))
+        print("Errors (skipped items):  " + str(stats["errors"]))
+        print("Listings with seller rating data: " + str(stats["seller_data"])
+              + " (0 means Vinted gave no ratings, so the rating filter is inactive)")
 
-    save_json(SEEN_FILE, sorted(seen)[-5000:])
-    day["runs"] = day.get("runs", 0) + 1
-    for k in STAT_KEYS:
-        day[k] = day.get(k, 0) + stats[k]
-    save_json(STATS_FILE, day)
-
-    print("\n===== SUMMARY =====")
-    print("Listings checked:        " + str(stats["checked"]))
-    print("Already seen (skipped):  " + str(stats["already_seen"]))
-    print("Kids items blocked:      " + str(stats["kids"]))
-    print("Wrong brand blocked:     " + str(stats["brand_mismatch"]))
-    print("Not the wanted type:     " + str(stats["keyword_missing"]))
-    print("Modern items skipped:    " + str(stats["modern_skipped"]))
-    print("Condition red flags:     " + str(stats["condition_flags"]))
-    print("Junk word / wrong size:  " + str(stats["junk_or_size"]))
-    print("Seller filtered:         " + str(stats["seller_filtered"]))
-    print("Price out of range:      " + str(stats["price_out_of_range"]))
-    print("Profit too low:          " + str(stats["low_profit"]))
-    print("Qualified deals:         " + str(stats["qualified"]))
-    print("Alerts sent to Discord:  " + str(stats["sent"]))
-    print("Errors (skipped items):  " + str(stats["errors"]))
-    print("Listings with seller rating data: " + str(stats["seller_data"])
-          + " (0 means Vinted gave no ratings, so the rating filter is inactive)")
-
-    if near_misses:
-        near_misses.sort(reverse=True)
-        print("\nClosest near-misses (profit too low):")
-        for profit, title, price in near_misses[:5]:
-            print("  GBP " + format(price, ".2f") + " '" + title[:50] + "' -> profit GBP " + format(profit, ".2f"))
+        if near_misses:
+            near_misses.sort(reverse=True)
+            print("\nClosest near-misses (profit too low):")
+            for profit, title, price in near_misses[:5]:
+                print("  GBP " + format(price, ".2f") + " '" + title[:50] + "' -> profit GBP " + format(profit, ".2f"))
+    finally:
+        # always write state, even if something above went wrong
+        save_state(seen, alerted, day)
 
 
 if __name__ == "__main__":
