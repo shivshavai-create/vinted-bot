@@ -31,9 +31,14 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run bot
-        timeout-minutes: 16
+        timeout-minutes: 17
         env:
           DISCORD_WEBHOOK_CARHARTT: ${{ secrets.DISCORD_WEBHOOK_CARHARTT }}
+          DISCORD_WEBHOOK_RALPHLAUREN: ${{ secrets.DISCORD_WEBHOOK_RALPHLAUREN }}
+          DISCORD_WEBHOOK_FOOTBALLSHIRTS: ${{ secrets.DISCORD_WEBHOOK_FOOTBALLSHIRTS }}
+          DISCORD_WEBHOOK_CAMERAS: ${{ secrets.DISCORD_WEBHOOK_CAMERAS }}
+          DISCORD_WEBHOOK_PATAGONIA: ${{ secrets.DISCORD_WEBHOOK_PATAGONIA }}
+          DISCORD_WEBHOOK_NIKESHOES: ${{ secrets.DISCORD_WEBHOOK_NIKESHOES }}
           DISCORD_WEBHOOK_MERTRA: ${{ secrets.DISCORD_WEBHOOK_MERTRA }}
         run: python main.py
 
