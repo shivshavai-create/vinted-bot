@@ -2,38 +2,41 @@ import math
 import os
 
 # ---------------------------------------------------------------
-# WEBHOOKS
-# Two destinations (Discord channels). Each one reads a GitHub Secret.
-#   sniper = everything except Mertra (secret name unchanged)
-#   mertra = Mertra + North Face puffers only
+# WEBHOOKS: one Discord channel per destination, each fed by a GitHub Secret
+# (the "sniper" channel is gone: everything is sorted into these)
 # ---------------------------------------------------------------
 WEBHOOK_SECRETS = {
-    "sniper": "DISCORD_WEBHOOK_CARHARTT",
+    "carhartt": "DISCORD_WEBHOOK_CARHARTT",
+    "ralphlauren": "DISCORD_WEBHOOK_RALPHLAUREN",
+    "footballshirts": "DISCORD_WEBHOOK_FOOTBALLSHIRTS",
+    "cameras": "DISCORD_WEBHOOK_CAMERAS",
+    "patagonia": "DISCORD_WEBHOOK_PATAGONIA",
+    "nikeshoes": "DISCORD_WEBHOOK_NIKESHOES",
     "mertra": "DISCORD_WEBHOOK_MERTRA",
 }
 
-# Every search belongs to a CATEGORY. The category decides the rules, tag, colour
-# and which destination (channel) the alert goes to.
+# Every search belongs to a CATEGORY. The category decides the rules, tag, colour,
+# bot name and which destination (channel) the alert goes to.
 CATEGORY_DESTINATION = {
-    "carhartt": "sniper",
-    "dickies": "sniper",
-    "ralph_lauren": "sniper",
-    "football": "sniper",
-    "cameras": "sniper",
-    "patagonia": "sniper",
-    "shoes": "sniper",
+    "carhartt": "carhartt",
+    "dickies": "carhartt",
+    "ralph_lauren": "ralphlauren",
+    "football": "footballshirts",
+    "cameras": "cameras",
+    "patagonia": "patagonia",
+    "shoes": "nikeshoes",
     "mertra_tnf": "mertra",
 }
 
 # (kept the old name: these are the enabled categories)
 ENABLED_CHANNELS = set(CATEGORY_DESTINATION.keys())
 
-# Destination that receives the once-a-day summary message
-SUMMARY_CHANNEL = "sniper"
+# Destination that receives the daily summary + the "Vinted is blocking us" warning
+SUMMARY_CHANNEL = "carhartt"
 
 
 def destination_for(category):
-    return CATEGORY_DESTINATION.get(category, "sniper")
+    return CATEGORY_DESTINATION.get(category, SUMMARY_CHANNEL)
 
 
 def get_webhook(destination):
@@ -41,7 +44,7 @@ def get_webhook(destination):
 
 
 # ---------------------------------------------------------------
-# EMBED LOOK: tag + colour per category
+# EMBED LOOK
 # ---------------------------------------------------------------
 CATEGORY_TAG = {
     "ralph_lauren": "[RL]",
@@ -65,19 +68,54 @@ CATEGORY_COLOUR = {
 }
 BUNDLE_COLOUR = 0xFFD700        # gold
 
+# Each category posts under its own bot name (shown in Discord next to the message)
+CATEGORY_BOT_NAME = {
+    "carhartt": "Workwear Watch \U0001F9E5",
+    "dickies": "Workwear Watch \U0001F9E5",
+    "ralph_lauren": "Polo Patrol \U0001F3C7",
+    "football": "Kickoff Hunter \u26BD",
+    "cameras": "Snap Sniper \U0001F4F7",
+    "patagonia": "Fleece Finder \U0001F9F6",
+    "shoes": "Sole Sniper \U0001F45F",
+    "mertra_tnf": "Mertra Radar \U0001F4E1",
+}
+CATEGORY_ICON = {
+    "carhartt": "\U0001F9E5", "dickies": "\U0001F9E5", "ralph_lauren": "\U0001F3C7",
+    "football": "\u26BD", "cameras": "\U0001F4F7", "patagonia": "\U0001F9F6",
+    "shoes": "\U0001F45F", "mertra_tnf": "\U0001F4E1",
+}
+BUNDLE_BOT_NAME = "Wardrobe Watch \U0001F4E6"
+DEFAULT_BOT_NAME = "Deal Hunter"
+
+# Optional: a picture for each bot. Paste an image link, e.g. {"cameras": "https://.../cam.png"}
+CATEGORY_AVATAR = {}
+
+# Optional: ping a Discord role for a category (turn on Developer Mode, right-click the
+# role, Copy Role ID). e.g. {"cameras": "123456789012345678"}
+ROLE_PING_IDS = {}
+
+# Profit tier shown in the title: (profit at asking price, label). Highest first.
+PROFIT_TIERS = [
+    (40.0, "\U0001F48E JACKPOT"),
+    (20.0, "\U0001F525 GREAT"),
+    (8.0, "\U0001F7E2 SOLID"),
+    (-9999.0, "\U0001F3AF SNIPE"),
+]
+
 # ---------------------------------------------------------------
 # BUNDLES (same seller, 2+ matching items in one run = ONE gold embed)
-# A bundle containing a Mertra / North Face item is posted to the mertra channel
-# AND the sniper channel.
+# The bundle is posted to every channel one of its items belongs to.
+# BUNDLE_ALSO_POST_TO: {"channel it contains": "extra channel to post it to"}
 # ---------------------------------------------------------------
 BUNDLE_MIN_ITEMS = 2
 BUNDLE_MAX_ITEMS_SHOWN = 8
 BUNDLE_GALLERY_IMAGES = 4       # Discord shows up to 4 photos in a grid
+BUNDLE_ALSO_POST_TO = {"mertra": "carhartt"}    # set to {} to switch this off
 
 # ---------------------------------------------------------------
 # MERTRA PING
-# A single Mertra windbreaker / puffer that is at or under the search's
-# ping_under price pings @here in the mertra channel. Nothing else ever pings.
+# A single Mertra windbreaker / puffer at or under the search's ping_under price
+# pings @here in the mertra channel. Nothing else ever pings @here.
 # ---------------------------------------------------------------
 PING_TEXT = "@here \U0001F6A8 Mertra bargain!"
 
@@ -92,7 +130,7 @@ POSTAGE_COST = 2.50
 
 # Rules for one category
 ROI_BY_CHANNEL = {"shoes": 0.6, "cameras": 0.6, "football": 0.8, "patagonia": 0.8}
-MIN_PROFIT_BY_CHANNEL = {"shoes": 12.0, "cameras": 12.0, "football": 7.0, "patagonia": 8.0}
+MIN_PROFIT_BY_CHANNEL = {"shoes": 12.0, "cameras": 10.0, "football": 7.0, "patagonia": 8.0}
 POSTAGE_BY_CHANNEL = {"shoes": 5.0, "cameras": 4.0, "football": 3.0, "patagonia": 3.5}
 
 # Looser rules when a RARE keyword is found (see RARE_WORDS)
@@ -103,12 +141,12 @@ RARE_MAX_BUY_MULTIPLIER = 1.3   # allowed to pay 30 percent more for rare finds
 # ---------------------------------------------------------------
 # ALERT LIMITS PER RUN (a bundle counts as ONE message)
 # ---------------------------------------------------------------
-ITEMS_PER_SEARCH = 10           # a search can override this with items=N
-MAX_ALERTS_PER_RUN = 20
+ITEMS_PER_SEARCH = 12           # a search can override this with items=N
+MAX_ALERTS_PER_RUN = 25
 MAX_ALERTS_PER_CHANNEL = 3      # per category
 MAX_ALERTS_BY_CHANNEL = {
-    "mertra_tnf": 5, "shoes": 5, "cameras": 5, "football": 4,
-    "patagonia": 3, "ralph_lauren": 4,
+    "mertra_tnf": 5, "shoes": 5, "cameras": 5, "football": 5,
+    "patagonia": 4, "ralph_lauren": 4,
 }
 
 # ---------------------------------------------------------------
@@ -117,7 +155,7 @@ MAX_ALERTS_BY_CHANNEL = {
 SEEN_RETENTION_DAYS = 45
 ALERTED_ID_RETENTION_DAYS = 180
 ALERTED_RELIST_RETENTION_DAYS = 60
-TIME_BUDGET_SECONDS = 720       # stop searching after 12 minutes and save state
+TIME_BUDGET_SECONDS = 780       # stop searching after 13 minutes and save state
 
 # ---------------------------------------------------------------
 # LIVE PRICE CHECK
@@ -163,7 +201,8 @@ BRAND_WORDS = {
     "ralph_lauren": ["ralph lauren", "ralph", "polo", "rrl", "double rl"],
     "mertra_tnf": ["mertra", "north face", "northface", "tnf"],
     "shoes": ["new balance", "newbalance", "nike", "jordan", "air max", "air force",
-              "react", "huarache", "cortez", "vapormax", "vomero"],
+              "react", "huarache", "cortez", "vapormax", "vomero", "shox", "p-6000",
+              "presto", "blazer"],
     "football": ["nike", "umbro", "adidas", "kappa"],
     "cameras": ["canon", "sony", "fuji", "fujifilm", "nikon", "olympus", "panasonic",
                 "pentax", "ricoh", "casio", "kodak", "minolta", "konica", "yashica",
@@ -345,6 +384,7 @@ MODEL_TIERS = {
         {"words": ["rugby"], "resell": 30},
         {"words": ["harrington"], "resell": 40},
         {"words": ["bear"], "resell": 30},
+        {"words": ["stadium", "snow beach"], "resell": 55},
         {"words": ["purple label", "double rl", "rrl"], "resell": 70},
     ],
     "mertra_tnf": [
@@ -354,9 +394,13 @@ MODEL_TIERS = {
         # --- New Balance ---
         {"words": ["9060"], "resell": 55},
         {"words": ["2002r"], "resell": 55},
+        {"words": ["1906r"], "resell": 55},
         {"words": ["550"], "resell": 42},
         {"words": ["327"], "resell": 32},
         {"words": ["530"], "resell": 30},
+        {"words": ["996"], "resell": 32},
+        {"words": ["998"], "resell": 60},
+        {"words": ["576"], "resell": 55},
         {"words": ["990v3", "990 v3"], "resell": 85},
         {"words": ["990v4", "990 v4"], "resell": 75},
         {"words": ["991"], "resell": 65},
@@ -365,6 +409,7 @@ MODEL_TIERS = {
         {"words": ["air max 90"], "resell": 38},
         {"words": ["air max 95"], "resell": 42},
         {"words": ["air max 97"], "resell": 42},
+        {"words": ["air max 98"], "resell": 40},
         {"words": ["air max plus"], "resell": 42},
         {"words": ["air max 1"], "resell": 40},
         {"words": ["air max 270"], "resell": 35},
@@ -377,30 +422,37 @@ MODEL_TIERS = {
         {"words": ["huarache"], "resell": 30},
         {"words": ["cortez"], "resell": 28},
         {"words": ["vomero 5"], "resell": 50},
+        {"words": ["shox"], "resell": 50},
+        {"words": ["p-6000"], "resell": 38},
+        {"words": ["blazer"], "resell": 28},
+        {"words": ["presto"], "resell": 30},
     ],
+    # Cameras: BRUTAL. Family searches only alert when one of these models shows up.
     "cameras": [
-        {"words": ["ixus 70", "ixus70"], "resell": 55},
-        {"words": ["ixus 80", "ixus80"], "resell": 55},
-        {"words": ["ixus 100"], "resell": 48},
-        {"words": ["ixus 860"], "resell": 45},
-        {"words": ["ixus 870"], "resell": 50},
-        {"words": ["ixus 960"], "resell": 50},
-        {"words": ["powershot g10"], "resell": 65},
-        {"words": ["powershot g11", "powershot g12", "powershot g9"], "resell": 70},
-        {"words": ["powershot s90"], "resell": 55},
-        {"words": ["powershot s95"], "resell": 65},
-        {"words": ["rx100"], "resell": 120},
-        {"words": ["dsc-w"], "resell": 42},
-        {"words": ["dsc-t"], "resell": 45},
-        {"words": ["f31fd", "finepix f30"], "resell": 65},
-        {"words": ["f200exr", "f300exr", "f550exr"], "resell": 55},
-        {"words": ["mju ii", "mju 2", "mju-ii", "mju iii", "stylus epic"], "resell": 90},
-        {"words": ["mju", "stylus"], "resell": 55},
-        {"words": ["lx3", "lx5"], "resell": 80},
-        {"words": ["lx7"], "resell": 115},
-        {"words": ["sure shot", "sureshot"], "resell": 35},
-        {"words": ["espio"], "resell": 35},
-        {"words": ["trip 35"], "resell": 80},
+        {"words": ["ixus 70", "ixus70", "ixus 80", "ixus80"], "resell": 35},
+        {"words": ["ixus 75", "ixus 85", "ixus 90", "ixus 95"], "resell": 30},
+        {"words": ["ixus 100"], "resell": 30},
+        {"words": ["ixus 860"], "resell": 28},
+        {"words": ["ixus 870"], "resell": 30},
+        {"words": ["ixus 960"], "resell": 32},
+        {"words": ["ixus 115", "ixus 120", "ixus 125", "ixus 130"], "resell": 25},
+        {"words": ["powershot g10"], "resell": 45},
+        {"words": ["powershot g11", "powershot g12", "powershot g9"], "resell": 50},
+        {"words": ["powershot s90"], "resell": 38},
+        {"words": ["powershot s95"], "resell": 45},
+        {"words": ["rx100"], "resell": 90},
+        {"words": ["dsc-w"], "resell": 25},
+        {"words": ["dsc-t"], "resell": 28},
+        {"words": ["f31fd", "finepix f30"], "resell": 40},
+        {"words": ["f200exr", "f300exr", "f550exr"], "resell": 35},
+        {"words": ["mju ii", "mju 2", "mju-ii", "mju iii", "stylus epic"], "resell": 65},
+        {"words": ["mju", "stylus"], "resell": 35},
+        {"words": ["lx3", "lx5"], "resell": 55},
+        {"words": ["lx7"], "resell": 80},
+        {"words": ["dmc-tz", "dmc-fz"], "resell": 30},
+        {"words": ["sure shot", "sureshot"], "resell": 22},
+        {"words": ["espio"], "resell": 22},
+        {"words": ["trip 35"], "resell": 55},
     ],
     "football": [
         {"words": ["sharp"], "resell": 40},
@@ -410,6 +462,7 @@ MODEL_TIERS = {
     ],
     "patagonia": [
         {"words": ["retro-x", "retro x", "retrox"], "resell": 50},
+        {"words": ["retro pile"], "resell": 45},
         {"words": ["snap-t", "snap t", "snapt"], "resell": 40},
         {"words": ["synchilla"], "resell": 36},
         {"words": ["better sweater"], "resell": 36},
@@ -494,8 +547,8 @@ def _rl(query, resell, **extra):
 
 
 def _cam(query, resell, **extra):
-    """A camera search: no size filter, minimum buy 12 pounds (junk guard)."""
-    extra.setdefault("min_buy", 12)
+    """A camera search: no size filter, minimum buy 8 pounds (junk guard)."""
+    extra.setdefault("min_buy", 8)
     extra.setdefault("items", 20)
     extra.setdefault("require_any", CAMERA_WORDS)
     return _t(query, resell, "cameras", None, **extra)
@@ -522,27 +575,41 @@ TARGETS = [
     _t("carhartt detroit jacket", 30, "carhartt", "tops"),
     _t("carhartt santa fe jacket", 30, "carhartt", "tops"),
     _t("carhartt active jacket", 30, "carhartt", "tops"),
+    _t("carhartt chore coat", 30, "carhartt", "tops"),
+    _t("carhartt arctic jacket", 30, "carhartt", "tops"),
+    _t("carhartt michigan coat", 30, "carhartt", "tops"),
+    _t("carhartt blanket lined jacket", 30, "carhartt", "tops"),
+    _t("carhartt vintage jacket", 30, "carhartt", "tops"),
+    _t("carhartt vintage coat", 20, "carhartt", "tops"),
+    _t("carhartt hoodie", 20, "carhartt", "tops"),
+    _t("carhartt tee", 12, "carhartt", "tops"),
     _t("carhartt jeans", 15, "carhartt", "bottoms", alert_under=8, no_modern=True),
     _t("carhartt carpenter jeans", 15, "carhartt", "bottoms", alert_under=8, no_modern=True),
-    _t("carhartt tee", 12, "carhartt", "tops"),
-    _t("carhartt vintage coat", 20, "carhartt", "tops"),
     _t("carhartt double knee pants", 22, "carhartt", "bottoms"),
     _t("carhartt single knee pants", 17, "carhartt", "bottoms"),
 
     # ----- DICKIES -----
     _t("dickies eisenhower jacket", 27, "dickies", "tops"),
     _t("dickies duck jacket", 27, "dickies", "tops"),
+    _t("dickies work jacket", 27, "dickies", "tops"),
     _t("dickies jeans", 14, "dickies", "bottoms", alert_under=7, no_modern=True),
     _t("dickies carpenter jeans", 14, "dickies", "bottoms", alert_under=7, no_modern=True),
 
     # ----- [RL] RALPH LAUREN: knits, quarter zips, rugby, jackets, rare tags -----
     _rl("ralph lauren knit", 18),
     _rl("ralph lauren cable knit jumper", 18),
+    _rl("ralph lauren fair isle jumper", 28),
+    _rl("ralph lauren aran jumper", 25),
     _rl("ralph lauren bear jumper", 30),
+    _rl("ralph lauren cardigan", 20),
     _rl("ralph lauren quarter zip", 20),
+    _rl("ralph lauren half zip jumper", 20),
     _rl("ralph lauren rugby shirt", 26),
     _rl("ralph lauren harrington jacket", 36, max_buy=18),
     _rl("ralph lauren jacket", 28),
+    _rl("ralph lauren varsity jacket", 30),
+    _rl("ralph lauren stadium jacket", 55),
+    _rl("ralph lauren snow beach", 55),
     _rl("polo sport jacket", 30),
     _rl("polo sport knit", 24),
     _rl("polo country", 28),
@@ -573,53 +640,79 @@ TARGETS = [
     _foot("00s football shirt", 28),
     _foot("retro football shirt", 26),
     _foot("umbro football shirt", 28),
+    _foot("umbro 90s shirt", 28),
     _foot("kappa football shirt", 30),
     _foot("adidas football shirt 90s", 28),
+    _foot("adidas football shirt 00s", 28),
     _foot("nike football shirt 90s", 28),
+    _foot("nike football shirt 00s", 28),
     _foot("pirelli football shirt", 35),
     _foot("opel football shirt", 32),
     _foot("sharp football shirt", 38),
     _foot("carlsberg football shirt", 32),
     _foot("o2 football shirt", 28),
     _foot("vodafone football shirt", 28),
+    _foot("jvc football shirt", 30),
+    _foot("samsung football shirt", 28),
+    _foot("manchester united football shirt 90s", 32),
+    _foot("arsenal football shirt 90s", 30),
+    _foot("liverpool football shirt 90s", 30),
+    _foot("chelsea football shirt 90s", 30),
+    _foot("tottenham football shirt 90s", 28),
+    _foot("newcastle football shirt 90s", 28),
+    _foot("everton football shirt 90s", 28),
+    _foot("leeds football shirt 90s", 28),
+    _foot("england football shirt 90s", 30),
+    _foot("celtic football shirt vintage", 28),
+    _foot("rangers football shirt vintage", 28),
+    _foot("italy football shirt 90s", 28),
+    _foot("brazil football shirt 90s", 30),
 
     # ----- [CAM] cameras only (accessories blocked, untested = resell x0.7) -----
-    _cam("canon ixus 70", 55),
-    _cam("canon ixus 80", 55),
-    _cam("canon ixus 100", 48),
-    _cam("canon ixus 860", 45),
-    _cam("canon ixus 870", 50),
-    _cam("canon ixus 960", 50),
-    _cam("canon powershot g10", 65),
-    _cam("canon powershot g11", 70),
-    _cam("canon powershot s95", 65),
-    _cam("canon powershot s90", 55),
-    _cam("canon ixus", 35, items=30),
-    _cam("canon powershot", 30, items=30),
-    _cam("sony cybershot dsc-w", 42, items=30),
-    _cam("sony cybershot dsc-t", 45),
-    _cam("sony cyber-shot", 35, items=30),
-    _cam("sony rx100", 120),
-    _cam("fujifilm finepix f31fd", 65),
-    _cam("fujifilm finepix f200exr", 55),
-    _cam("fujifilm finepix", 30, items=30),
-    _cam("nikon coolpix", 32, items=30),
-    _cam("olympus mju ii", 90),
-    _cam("olympus mju", 55),
-    _cam("olympus stylus", 50),
-    _cam("panasonic lumix lx3", 80),
-    _cam("panasonic lumix lx5", 85),
-    _cam("panasonic lumix", 38, items=30),
-    _cam("canon sure shot 35mm", 35),
-    _cam("pentax espio", 35),
-    _cam("35mm compact camera", 28, items=30),
-    _cam("digicam", 32, items=30),
+    _cam("canon ixus 70", 35),
+    _cam("canon ixus 80", 35),
+    _cam("canon ixus 75", 30),
+    _cam("canon ixus 85", 30),
+    _cam("canon ixus 100", 30),
+    _cam("canon ixus 860", 28),
+    _cam("canon ixus 870", 30),
+    _cam("canon ixus 960", 32),
+    _cam("canon powershot g10", 45),
+    _cam("canon powershot g11", 50),
+    _cam("canon powershot s95", 45),
+    _cam("canon powershot s90", 38),
+    _cam("canon ixus", 25, items=30),
+    _cam("canon powershot", 25, items=30),
+    _cam("sony cybershot dsc-w", 25, items=30),
+    _cam("sony cybershot dsc-t", 28),
+    _cam("sony cyber-shot", 25, items=30),
+    _cam("sony rx100", 90),
+    _cam("fujifilm finepix f31fd", 40),
+    _cam("fujifilm finepix f200exr", 35),
+    _cam("fujifilm finepix", 25, items=30),
+    _cam("nikon coolpix", 25, items=30),
+    _cam("olympus mju ii", 65),
+    _cam("olympus mju", 35),
+    _cam("olympus stylus", 35),
+    _cam("olympus trip 35", 55),
+    _cam("panasonic lumix lx3", 55),
+    _cam("panasonic lumix lx5", 55),
+    _cam("panasonic lumix", 25, items=30),
+    _cam("canon sure shot 35mm", 22),
+    _cam("pentax espio", 22),
+    _cam("35mm compact camera", 25, items=30),
+    _cam("digicam", 25, items=30),
 
     # ----- [PATAGONIA] fleeces: Synchilla, Snap-T, Better Sweater, Retro-X -----
     _pat("patagonia synchilla", 36),
+    _pat("patagonia lightweight synchilla", 32),
     _pat("patagonia snap t", 40),
     _pat("patagonia better sweater", 36),
     _pat("patagonia retro x", 50),
+    _pat("patagonia retro pile", 45),
+    _pat("patagonia fleece jacket", 32, items=30),
+    _pat("patagonia pullover fleece", 30, items=30),
+    _pat("patagonia vintage fleece", 36),
     _pat("patagonia fleece", 30, items=30),
 
     # ===============================================================
@@ -631,9 +724,13 @@ TARGETS = [
     # --- New Balance ---
     _shoe("new balance 9060", 55),
     _shoe("new balance 2002r", 55),
+    _shoe("new balance 1906r", 55),
     _shoe("new balance 550", 42),
     _shoe("new balance 327", 32),
     _shoe("new balance 530", 30),
+    _shoe("new balance 996", 32),
+    _shoe("new balance 998", 60),
+    _shoe("new balance 576", 55),
     _shoe("new balance 990v3", 85),
     _shoe("new balance 990v4", 75),
     _shoe("new balance 991", 65),
@@ -646,6 +743,7 @@ TARGETS = [
     _shoe("nike air max 90", 38),
     _shoe("nike air max 95", 42),
     _shoe("nike air max 97", 42),
+    _shoe("nike air max 98", 40),
     _shoe("nike air max plus", 42),
     _shoe("nike air max 1", 40),
     _shoe("nike air max 270", 35),
@@ -658,6 +756,10 @@ TARGETS = [
     _shoe("nike huarache", 30),
     _shoe("nike cortez", 28),
     _shoe("nike vomero 5", 50),
+    _shoe("nike shox", 50),
+    _shoe("nike p-6000", 38),
+    _shoe("nike blazer", 28),
+    _shoe("nike air presto", 30),
     _shoe("nike react", 28, items=30),
     _shoe("nike air max", 28, items=30),
 ]
@@ -675,6 +777,11 @@ MISSPELL_PLAN = [
      [("jacket", "tops", 27)]),
     ("ralph_lauren", ["ralf lauren", "ralph laren", "ralph lauran"],
      [("jumper", "tops", 18, {"require_any": RL_TYPE_WORDS})]),
+    ("patagonia", ["patagonai", "patagona", "patogonia"],
+     [("fleece", "tops", 36, {"min_buy": 8, "require_any": PATAGONIA_WORDS})]),
+    ("cameras", ["cannon"],
+     [("ixus", None, 25, {"min_buy": 8, "require_any": CAMERA_WORDS}),
+      ("powershot", None, 25, {"min_buy": 8, "require_any": CAMERA_WORDS})]),
     ("mertra_tnf", ["northface", "tnf"],
      [("puffer", "tops", 32, {"alert_under": 16, "require_any": NF_PUFFER_WORDS})]),
     ("mertra_tnf", ["mertrra", "meertra"],
