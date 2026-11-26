@@ -34,9 +34,7 @@ jobs:
         timeout-minutes: 16
         env:
           DISCORD_WEBHOOK_CARHARTT: ${{ secrets.DISCORD_WEBHOOK_CARHARTT }}
-          DISCORD_WEBHOOK_RALPHLAUREN: ${{ secrets.DISCORD_WEBHOOK_RALPHLAUREN }}
           DISCORD_WEBHOOK_MERTRA: ${{ secrets.DISCORD_WEBHOOK_MERTRA }}
-          DISCORD_WEBHOOK_PATAGONIA: ${{ secrets.DISCORD_WEBHOOK_PATAGONIA }}
         run: python main.py
 
       - name: Save bot state
