@@ -115,6 +115,15 @@ def get_image_url(item):
     return None
 
 
+def text_field(item, *names):
+    """First non-empty text value among the given field names."""
+    for n in names:
+        v = field(item, n)
+        if v is not None and not isinstance(v, (dict, list, tuple)) and str(v).strip():
+            return str(v).strip()
+    return None
+
+
 def lens_link(img):
     if not img:
         return None
@@ -226,6 +235,9 @@ def validate_config():
             errors.append("Category '" + ch + "' needs a CATEGORY_TAG and CATEGORY_COLOUR")
     if cfg.SUMMARY_CHANNEL not in cfg.WEBHOOK_SECRETS:
         errors.append("SUMMARY_CHANNEL '" + cfg.SUMMARY_CHANNEL + "' is missing from WEBHOOK_SECRETS")
+    for src, extra in cfg.BUNDLE_ALSO_POST_TO.items():
+        if src not in cfg.WEBHOOK_SECRETS or extra not in cfg.WEBHOOK_SECRETS:
+            errors.append("BUNDLE_ALSO_POST_TO has an unknown channel: " + str(src) + " -> " + str(extra))
 
     for i, t in enumerate(cfg.TARGETS):
         label = "TARGETS[" + str(i) + "] " + str(t.get("query", "?"))
@@ -475,16 +487,61 @@ def suggest_offer(price):
 
 
 # ---------------------------------------------------------------
+# visual helpers
+# ---------------------------------------------------------------
+def tier_label(profit):
+    for threshold, label in cfg.PROFIT_TIERS:
+        if profit >= threshold:
+            return label
+    return cfg.PROFIT_TIERS[-1][1]
+
+
+def deal_roi(d):
+    return (d["net_profit"] / d["price"]) if d["price"] > 0 else 0.0
+
+
+def score_stars(roi):
+    roi = max(roi, 0.0)
+    if roi >= 3.0:
+        n = 5
+    elif roi >= 2.0:
+        n = 4
+    elif roi >= 1.2:
+        n = 3
+    elif roi >= 0.8:
+        n = 2
+    else:
+        n = 1
+    return "\u2B50" * n + "\u2606" * (5 - n)
+
+
+def roi_bar(roi):
+    roi = max(roi, 0.0)
+    blocks = min(10, int(round(roi / 3.0 * 10)))
+    return "\u25B0" * blocks + "\u25B1" * (10 - blocks) + "  " + str(int(round(roi * 100))) + "%"
+
+
+def mk_field(name, value, inline=True):
+    return {"name": name[:256], "value": (str(value) or "-")[:1024], "inline": inline}
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------
 # discord
 # ---------------------------------------------------------------
-def post_payload(destination, payload, mentions=None):
+def post_payload(destination, payload, mentions=None, username=None, avatar=None):
     webhook = cfg.get_webhook(destination)
     if not webhook:
         print("[WARN] No webhook secret set for " + destination)
         return False
 
     body = dict(payload)
-    body["username"] = "Deal Hunter"
+    body["username"] = (username or cfg.DEFAULT_BOT_NAME)[:80]
+    if avatar:
+        body["avatar_url"] = avatar
     body["allowed_mentions"] = mentions or {"parse": []}
     r = None
     for attempt in range(3):
@@ -513,6 +570,10 @@ def post_text(destination, text):
 
 
 def build_single_embed(d):
+    roi = deal_roi(d)
+    tag = cfg.CATEGORY_TAG.get(d["channel"], "")
+    icon = cfg.CATEGORY_ICON.get(d["channel"], "")
+
     flags = []
     if d.get("era_note"):
         flags.append(d["era_note"])
@@ -530,35 +591,52 @@ def build_single_embed(d):
         flags.append(d["market_note"])
     if d["misspelled"]:
         flags.append("MISSPELLED LISTING - double check it is genuine")
+    if d.get("ping"):
+        flags.append("BARGAIN PING")
 
-    lines = ["Ask: **" + money(d["price"]) + "**  |  Resell: " + money(d["resell"])]
+    fields = [
+        mk_field("\U0001F4B7 Ask", money(d["price"])),
+        mk_field("\U0001F3F7\uFE0F Resell", money(d["resell"])),
+        mk_field("\U0001F4B0 Profit", "+" + money(d["net_profit"])),
+        mk_field("\U0001F4C8 ROI", roi_bar(roi), False),
+    ]
+    if d.get("size"):
+        fields.append(mk_field("\U0001F4CF Size", d["size"]))
+    if d.get("status"):
+        fields.append(mk_field("\u2728 Condition", d["status"]))
+    if d.get("brand"):
+        fields.append(mk_field("\U0001F3E2 Brand", d["brand"]))
     if d["offer"] is not None:
-        lines.append("Profit at asking: **+" + money(d["net_profit"]) + "**  |  With offer ("
-                     + money(d["offer"]) + "): **+" + money(d["profit_offer"]) + "** \U0001F4B0")
-        lines.append("\U0001F91D " + cfg.OFFER_MESSAGE.replace("{offer}", money(d["offer"])))
-    else:
-        lines.append("Profit: **+" + money(d["net_profit"]) + "** \U0001F4B0")
+        fields.append(mk_field("\U0001F91D Offer " + money(d["offer"]),
+                               "Profit with offer: +" + money(d["profit_offer"]), False))
+        fields.append(mk_field("\U0001F4AC Copy and send",
+                               "```" + cfg.OFFER_MESSAGE.replace("{offer}", money(d["offer"])) + "```", False))
     if flags:
-        lines.append("\U0001F3AF " + "  |  ".join(flags))
-    lines.append("\U0001F50D " + cfg.CHECKLISTS.get(d["channel"], "Inspect tags and stitching carefully"))
-    if d["seller_login"]:
-        lines.append("Seller: " + str(d["seller_login"]))
+        fields.append(mk_field("\U0001F3AF Flags", "\n".join("\u2022 " + f for f in flags), False))
+    fields.append(mk_field("\U0001F50E Check before buying",
+                           cfg.CHECKLISTS.get(d["channel"], "Inspect tags and stitching carefully"), False))
 
     links = ["[\U0001F6D2 Open on Vinted](" + d["url"] + ")"]
     lens = lens_link(d.get("image"))
     if lens:
         links.append(lens)
     links.append("[\U0001F4C8 eBay sold comps](" + sold_link(d["title"]) + ")")
-    lines.append("  |  ".join(links))
+    fields.append(mk_field("\U0001F517 Links", "  \u00B7  ".join(links), False))
 
-    tag = cfg.CATEGORY_TAG.get(d["channel"], "")
     embed = {
-        "title": (tag + " " + d["title"]).strip()[:250],
+        "title": (tier_label(d["net_profit"]) + " | " + tag + " " + d["title"]).strip()[:250],
         "url": d["url"],
         "color": cfg.CATEGORY_COLOUR.get(d["channel"], 0x95A5A6),
-        "description": "\n".join(lines)[:4000],
-        "footer": {"text": "Deal Hunter"},
+        "description": "**" + score_stars(roi) + "**  deal score",
+        "fields": fields,
+        "footer": {"text": "Deal Hunter " + icon + " " + tag},
+        "timestamp": now_iso(),
     }
+    if d.get("seller_login"):
+        author = {"name": "\U0001F464 " + str(d["seller_login"])}
+        if d.get("seller_id"):
+            author["url"] = BASE_URL + "/member/" + str(d["seller_id"])
+        embed["author"] = author
     if d.get("image"):
         embed["image"] = {"url": d["image"]}
     return embed
@@ -570,30 +648,34 @@ def build_bundle_embeds(deals):
     seller = deals[0]["seller_login"] or "unknown"
     total_ask = sum(x["price"] for x in deals)
     total_profit = sum(x["net_profit"] for x in deals)
+    total_resell = sum(x["resell"] for x in deals)
 
-    lines = [
-        "Seller: **" + str(seller) + "**  |  " + str(len(deals)) + " items  |  Total ask: **"
-        + money(total_ask) + "**  |  Total profit: **+" + money(total_profit) + "** \U0001F4B0",
-        "\U0001F4AC Ask the seller for a bundle price before buying one by one!",
-        "",
+    fields = [
+        mk_field("\U0001F4B7 Total ask", money(total_ask)),
+        mk_field("\U0001F3F7\uFE0F Total resell", money(total_resell)),
+        mk_field("\U0001F4B0 Total profit", "+" + money(total_profit)),
     ]
     for i, x in enumerate(shown, 1):
         tag = cfg.CATEGORY_TAG.get(x["channel"], "")
-        lines.append(str(i) + ". **" + tag + "** [" + clean_title(x["title"])[:70] + "](" + x["url"] + ")")
-        row = "    " + money(x["price"]) + " ask  |  resell " + money(x["resell"]) + "  |  profit **+" + money(x["net_profit"]) + "**"
+        value = (money(x["price"]) + " ask  \u00B7  resell " + money(x["resell"])
+                 + "  \u00B7  profit **+" + money(x["net_profit"]) + "**\n"
+                 + "[\U0001F6D2 Open](" + x["url"] + ")")
         lens = lens_link(x.get("image"))
         if lens:
-            row += "  |  " + lens
-        lines.append(row)
+            value += "  \u00B7  " + lens
+        fields.append(mk_field(str(i) + ". " + tag + " " + clean_title(x["title"])[:200], value, False))
     if len(deals) > len(shown):
-        lines.append("+ " + str(len(deals) - len(shown)) + " more items from this seller")
+        fields.append(mk_field("\u2795 More", str(len(deals) - len(shown)) + " more items from this seller", False))
 
     main = {
         "title": "\U0001F4E6 MULTI-ITEM WARDROBE DROP",
         "url": shown[0]["url"],
         "color": cfg.BUNDLE_COLOUR,
-        "description": "\n".join(lines)[:3900],
-        "footer": {"text": "Deal Hunter"},
+        "description": "**" + str(len(deals)) + " matching items** from **" + str(seller)
+                       + "**\n\U0001F4AC Ask for a bundle price before buying one by one!",
+        "fields": fields,
+        "footer": {"text": "Deal Hunter \U0001F4E6 bundle"},
+        "timestamp": now_iso(),
     }
     embeds = [main]
     if shown[0].get("image"):
@@ -607,12 +689,24 @@ def build_bundle_embeds(deals):
 
 def send_single(d):
     dest = cfg.destination_for(d["channel"])
-    content = ""
-    mentions = None
+    content_parts = []
+    everyone = False
+    roles = []
     if d.get("ping") and dest == "mertra":
-        content = cfg.PING_TEXT
-        mentions = {"parse": ["everyone"]}
-    ok = post_payload(dest, {"content": content, "embeds": [build_single_embed(d)]}, mentions)
+        content_parts.append(cfg.PING_TEXT)
+        everyone = True
+    role_id = cfg.ROLE_PING_IDS.get(d["channel"])
+    if role_id:
+        content_parts.append("<@&" + str(role_id) + ">")
+        roles.append(str(role_id))
+    mentions = {"parse": ["everyone"] if everyone else []}
+    if roles:
+        mentions["roles"] = roles
+    ok = post_payload(dest,
+                      {"content": " ".join(content_parts), "embeds": [build_single_embed(d)]},
+                      mentions,
+                      username=cfg.CATEGORY_BOT_NAME.get(d["channel"]),
+                      avatar=cfg.CATEGORY_AVATAR.get(d["channel"]))
     if ok:
         print("[SENT] #" + dest + ": " + d["title"])
     return ok
@@ -624,20 +718,32 @@ def send_bundle(deals):
         dest = cfg.destination_for(x["channel"])
         if dest not in dests:
             dests.append(dest)
-    # a bundle with a Mertra / North Face item also goes to the sniper channel
-    if "mertra" in dests and "sniper" not in dests:
-        dests.append("sniper")
+    for dest in list(dests):
+        extra = cfg.BUNDLE_ALSO_POST_TO.get(dest)
+        if extra and extra not in dests:
+            dests.append(extra)
 
-    any_ping = any(x.get("ping") for x in deals)
     embeds = build_bundle_embeds(deals)
+    any_ping = any(x.get("ping") for x in deals)
     ok_any = False
     for dest in dests:
-        content = ""
-        mentions = None
+        content_parts = []
+        everyone = False
+        roles = []
         if any_ping and dest == "mertra":
-            content = cfg.PING_TEXT
-            mentions = {"parse": ["everyone"]}
-        if post_payload(dest, {"content": content, "embeds": embeds}, mentions):
+            content_parts.append(cfg.PING_TEXT)
+            everyone = True
+        for x in deals:
+            rid = cfg.ROLE_PING_IDS.get(x["channel"])
+            if rid and cfg.destination_for(x["channel"]) == dest and str(rid) not in roles:
+                roles.append(str(rid))
+        for rid in roles:
+            content_parts.append("<@&" + rid + ">")
+        mentions = {"parse": ["everyone"] if everyone else []}
+        if roles:
+            mentions["roles"] = roles
+        if post_payload(dest, {"content": " ".join(content_parts), "embeds": embeds}, mentions,
+                        username=cfg.BUNDLE_BOT_NAME):
             ok_any = True
             print("[SENT] BUNDLE #" + dest + ": " + str(len(deals)) + " items from " + str(deals[0]["seller_login"]))
         time.sleep(1)
@@ -645,7 +751,7 @@ def send_bundle(deals):
 
 
 # ---------------------------------------------------------------
-# daily summary (stored in stats.json)
+# daily summary (stored in stats.json) with the top 3 deals and photos
 # ---------------------------------------------------------------
 STAT_KEYS = ["checked", "already_alerted", "relist_blocked", "kids", "accessory_blocked",
              "brand_mismatch", "keyword_missing", "modern_skipped", "condition_flags",
@@ -654,10 +760,23 @@ STAT_KEYS = ["checked", "already_alerted", "relist_blocked", "kids", "accessory_
 
 
 def new_day_stats(day):
-    d = {"day": day, "runs": 0, "best_title": "", "best_profit": 0.0, "block_alerted": False}
+    d = {"day": day, "runs": 0, "best_title": "", "best_profit": 0.0, "block_alerted": False, "top": []}
     for k in STAT_KEYS:
         d[k] = 0
     return d
+
+
+def remember_top(day, d):
+    """Keep the 3 best deals of the day (with photo) for the daily summary."""
+    top = day.get("top")
+    if not isinstance(top, list):
+        top = []
+    top.append({
+        "title": d["title"], "profit": round(d["net_profit"], 2), "price": d["price"],
+        "url": d["url"], "image": d.get("image"), "tag": cfg.CATEGORY_TAG.get(d["channel"], ""),
+    })
+    top.sort(key=lambda x: x.get("profit", 0), reverse=True)
+    day["top"] = top[:3]
 
 
 def maybe_send_daily_summary(day_stats):
@@ -665,9 +784,8 @@ def maybe_send_daily_summary(day_stats):
         return
     g = day_stats.get
     lines = [
-        "\U0001F4CA **Deal Hunter daily summary for " + str(g("day")) + "**",
-        "Runs: " + str(g("runs", 0)) + " (should be about 24)",
-        "Listings checked: " + str(g("checked", 0)),
+        "Runs: **" + str(g("runs", 0)) + "** (should be about 24)",
+        "Listings checked: **" + str(g("checked", 0)) + "**",
         "Blocked: kids " + str(g("kids", 0)) + ", accessories " + str(g("accessory_blocked", 0))
         + ", wrong brand " + str(g("brand_mismatch", 0))
         + ", condition " + str(g("condition_flags", 0)) + ", junk/size " + str(g("junk_or_size", 0))
@@ -675,8 +793,8 @@ def maybe_send_daily_summary(day_stats):
         "Repeat protection: already alerted " + str(g("already_alerted", 0))
         + ", relists blocked " + str(g("relist_blocked", 0)),
         "Too expensive: " + str(g("price_out_of_range", 0)) + ", profit too low: " + str(g("low_profit", 0)),
-        "Deals found: " + str(g("qualified", 0)) + ", messages sent: " + str(g("sent", 0))
-        + " (wardrobe bundles: " + str(g("bundles", 0)) + ")",
+        "Deals found: **" + str(g("qualified", 0)) + "**, messages sent: **" + str(g("sent", 0))
+        + "** (wardrobe bundles: " + str(g("bundles", 0)) + ")",
     ]
     if g("keyword_missing", 0):
         lines.append("Skipped (not the wanted type): " + str(g("keyword_missing", 0)))
@@ -684,11 +802,35 @@ def maybe_send_daily_summary(day_stats):
         lines.append("Modern / wrong era skipped: " + str(g("modern_skipped", 0)))
     if g("errors", 0):
         lines.append("Listings that errored and were skipped: " + str(g("errors", 0)))
-    if g("best_title"):
-        lines.append("Best deal: " + str(g("best_title"))[:80] + " (+GBP " + format(g("best_profit", 0.0), ".2f") + ")")
-    else:
+    if not g("best_title"):
         lines.append("No deals passed the filters that day. Quiet is normal!")
-    post_text(cfg.SUMMARY_CHANNEL, "\n".join(lines))
+
+    embed = {
+        "title": "\U0001F4CA Deal Hunter daily summary - " + str(g("day")),
+        "color": 0x5865F2,
+        "description": "\n".join(lines)[:3800],
+        "footer": {"text": "Deal Hunter"},
+        "timestamp": now_iso(),
+    }
+    embeds = [embed]
+    top = g("top", [])
+    if isinstance(top, list) and top:
+        medals = ["\U0001F947", "\U0001F948", "\U0001F949"]
+        fields = []
+        for i, t in enumerate(top[:3]):
+            fields.append(mk_field(
+                medals[i] + " " + str(t.get("tag", "")) + " " + clean_title(t.get("title", ""))[:200],
+                "+" + money(float(t.get("profit", 0))) + " profit  \u00B7  ask " + money(float(t.get("price", 0)))
+                + "  \u00B7  [Open](" + str(t.get("url", BASE_URL)) + ")", False))
+        embed["fields"] = fields
+        first = top[0]
+        if first.get("image"):
+            embed["url"] = first.get("url", BASE_URL)
+            embed["image"] = {"url": first["image"]}
+            for t in top[1:3]:
+                if t.get("image"):
+                    embeds.append({"url": first.get("url", BASE_URL), "image": {"url": t["image"]}})
+    post_payload(cfg.SUMMARY_CHANNEL, {"embeds": embeds}, username="Deal Hunter \U0001F4CA")
     print("[INFO] Daily summary sent for " + str(g("day")))
 
 
@@ -726,7 +868,7 @@ def run():
     # rotate the start point every hour so, if time runs short, different searches get skipped
     targets = [t for t in cfg.TARGETS if t["channel"] in cfg.ENABLED_CHANNELS]
     if targets:
-        offset = (now.hour * 11) % len(targets)
+        offset = (now.hour * 17) % len(targets)
         targets = targets[offset:] + targets[:offset]
 
     try:
@@ -910,6 +1052,9 @@ def run():
                     deals.append({
                         "id": item_id, "title": title, "price": price,
                         "url": full_url(field(item, "url")), "image": get_image_url(item),
+                        "size": size_title or text_field(item, "size"),
+                        "status": text_field(item, "status", "condition"),
+                        "brand": brand_field or None,
                         "resell": resell, "net_profit": net_profit, "channel": channel,
                         "tier_word": tier_word, "model": model_name, "rare_word": rare_word,
                         "misspelled": misspelled,
@@ -989,6 +1134,7 @@ def run():
                     if d["net_profit"] > day.get("best_profit", 0.0):
                         day["best_profit"] = d["net_profit"]
                         day["best_title"] = d["title"]
+                    remember_top(day, d)
                 save_state(seen, alerted, day)
                 sent += 1
                 if u["type"] == "bundle":
