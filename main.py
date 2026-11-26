@@ -1,6 +1,7 @@
 import datetime
 import json
 import re
+import statistics
 import sys
 import time
 import urllib.parse
@@ -14,19 +15,35 @@ BASE_URL = "https://www.vinted.co.uk"
 SEEN_FILE = "seen.json"
 ALERTED_FILE = "alerted.json"
 STATS_FILE = "stats.json"
-VALID_KINDS = {"tops", "bottoms", "shoes", None}
+VALID_KINDS = {"tops", "bottoms", "shoes", "football", None}
 POUND = "\u00a3"
 START_TIME = time.time()
 
 scraper = VintedScraper(BASE_URL)
 
-BANNED_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.BANNED_WORDS) + r")\b", re.I)
 KIDS_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.KIDS_WORDS) + r")\b", re.I)
 KIDS_SIZE_RE = re.compile(r"\b\d+\s*(?:-\s*\d+\s*)?(?:y|yr|yrs|year|years|month|months|cm)\b", re.I)
 RED_FLAG_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.RED_FLAG_WORDS) + r")\b", re.I)
 VINTAGE_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.WORKWEAR_VINTAGE_WORDS) + r")\b", re.I)
-AUTH_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.AUTHENTIC_WORDS) + r")\b", re.I)
+BUNDLE_RE = re.compile(r"(^|\W)(with|inc|incl|including|includes|plus|comes|come|and|no|without|missing|needs|excl|excluding|minus|sans|w/)(\W|$)", re.I)
 NEGATION_RE = re.compile(r"\b(no|without|not|nothing|zero|never|nor|free of|free from)\b[^.!?\n]{0,25}$", re.I)
+
+# football era detection
+FOOTBALL_VINTAGE_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in cfg.FOOTBALL_VINTAGE_WORDS)
+    + r"|199\d|200\d|(?:9\d|0\d)[/-](?:9\d|0\d|10))\b", re.I)
+FOOTBALL_MODERN_RE = re.compile(r"\b(?:20[12]\d|(?:1\d|2\d)[/-](?:1\d|2\d))\b")
+FOOTBALL_SPONSOR_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.FOOTBALL_SPONSORS) + r")\b", re.I)
+
+# untested cameras
+UNTESTED_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.UNTESTED_WORDS) + r")\b", re.I)
+
+# per-category compiled regexes
+ACCESSORY_RES = {
+    ch: re.compile(r"\b(" + "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True)) + r")\b", re.I)
+    for ch, words in cfg.ACCESSORY_WORDS_BY_CHANNEL.items()
+}
+_banned_cache = {}
 
 
 # ---------------------------------------------------------------
@@ -69,12 +86,43 @@ def parse_price(raw):
         return None
 
 
+def money(x):
+    return POUND + format(x, ".2f")
+
+
 def full_url(raw_url):
     if not raw_url or not isinstance(raw_url, str) or raw_url == "0":
         return BASE_URL
     if raw_url.startswith("http"):
         return raw_url
     return BASE_URL + "/" + raw_url.lstrip("/")
+
+
+def get_image_url(item):
+    """Main photo of the listing (full size first, then the normal one)."""
+    candidates = []
+    photo = field(item, "photo")
+    if photo:
+        for key in ("full_size_url", "url"):
+            candidates.append(field(photo, key))
+    photos = field(item, "photos")
+    if isinstance(photos, (list, tuple)) and photos:
+        for key in ("full_size_url", "url"):
+            candidates.append(field(photos[0], key))
+    for c in candidates:
+        if isinstance(c, str) and c.startswith("http"):
+            return c
+    return None
+
+
+def lens_link(img):
+    if not img:
+        return None
+    return "[\U0001F50D Google Lens Check](https://lens.google.com/uploadbyurl?url=" + urllib.parse.quote(img, safe="") + ")"
+
+
+def clean_title(t):
+    return str(t).replace("[", "(").replace("]", ")")
 
 
 def normalize_items(res):
@@ -89,17 +137,6 @@ def normalize_items(res):
     if isinstance(inner, (list, tuple)):
         return list(inner)
     return []
-
-
-def describe_fields(obj):
-    if obj is None:
-        return []
-    if isinstance(obj, dict):
-        return sorted(str(k) for k in obj.keys())
-    try:
-        return sorted(k for k in vars(obj).keys() if not k.startswith("_"))
-    except TypeError:
-        return sorted(k for k in dir(obj) if not k.startswith("_"))[:40]
 
 
 def search_with_retry(query):
@@ -182,8 +219,11 @@ def validate_config():
     errors, warnings = [], []
 
     for ch in cfg.ENABLED_CHANNELS:
-        if ch not in cfg.WEBHOOK_SECRETS:
-            errors.append("Channel '" + ch + "' is enabled but missing from WEBHOOK_SECRETS")
+        dest = cfg.CATEGORY_DESTINATION.get(ch)
+        if dest not in cfg.WEBHOOK_SECRETS:
+            errors.append("Category '" + ch + "' points at unknown destination '" + str(dest) + "'")
+        if ch not in cfg.CATEGORY_TAG or ch not in cfg.CATEGORY_COLOUR:
+            errors.append("Category '" + ch + "' needs a CATEGORY_TAG and CATEGORY_COLOUR")
     if cfg.SUMMARY_CHANNEL not in cfg.WEBHOOK_SECRETS:
         errors.append("SUMMARY_CHANNEL '" + cfg.SUMMARY_CHANNEL + "' is missing from WEBHOOK_SECRETS")
 
@@ -197,24 +237,19 @@ def validate_config():
         if resell is None or max_buy is None:
             errors.append(label + " has a resell/max_buy that is not a number")
             continue
-        if t["channel"] not in cfg.WEBHOOK_SECRETS:
-            errors.append(label + " uses unknown channel '" + str(t["channel"]) + "'")
+        if t["channel"] not in cfg.CATEGORY_DESTINATION:
+            errors.append(label + " uses unknown category '" + str(t["channel"]) + "'")
         if t.get("kind") not in VALID_KINDS:
-            errors.append(label + " has invalid kind '" + str(t.get("kind")) + "' (use tops, bottoms, shoes)")
-        if "alert_under" in t and to_float(t["alert_under"]) is None:
-            errors.append(label + " has an alert_under that is not a number")
-        if "postage" in t and to_float(t["postage"]) is None:
-            errors.append(label + " has a postage that is not a number")
+            errors.append(label + " has invalid kind '" + str(t.get("kind")) + "' (use tops, bottoms, shoes, football)")
+        for key in ("alert_under", "postage", "ping_under"):
+            if key in t and to_float(t[key]) is None:
+                errors.append(label + " has a " + key + " that is not a number")
         if max_buy >= resell:
             warnings.append(label + ": max_buy is not below resell, it can never profit")
-        t_min_buy = to_float(t.get("min_buy", cfg.MIN_BUY_PRICE))
-        if (t["channel"] in cfg.ENABLED_CHANNELS and t_min_buy is not None and max_buy < t_min_buy
-                and not cfg.MODEL_TIERS.get(t["channel"])):
-            warnings.append(label + ": max_buy is below the minimum buy price (tiers may still raise it)")
 
-    for ch in sorted(cfg.ENABLED_CHANNELS):
-        if not cfg.get_webhook(ch):
-            warnings.append("No webhook secret found for '" + ch + "' - its alerts cannot be sent")
+    for dest in sorted(cfg.WEBHOOK_SECRETS):
+        if not cfg.get_webhook(dest):
+            warnings.append("No webhook secret found for '" + dest + "' - its alerts cannot be sent")
 
     for w in warnings:
         print("[CONFIG WARNING] " + w)
@@ -228,12 +263,28 @@ def validate_config():
 # ---------------------------------------------------------------
 # filters
 # ---------------------------------------------------------------
+def banned_re_for(channel):
+    if channel not in _banned_cache:
+        exempt = {w.lower() for w in cfg.BANNED_EXEMPT_BY_CHANNEL.get(channel, [])}
+        words = [w for w in cfg.BANNED_WORDS if w.lower() not in exempt]
+        _banned_cache[channel] = re.compile(r"\b(" + "|".join(re.escape(w) for w in words) + r")\b", re.I)
+    return _banned_cache[channel]
+
+
 def is_banned(text, channel):
     low = text.lower()
-    if BANNED_RE.search(low) or any(p in low for p in cfg.BANNED_PHRASES):
+    if banned_re_for(channel).search(low) or any(p in low for p in cfg.BANNED_PHRASES):
         return True
     for word in cfg.EXTRA_BANNED_BY_CHANNEL.get(channel, []):
         if re.search(r"\b" + re.escape(word) + r"\b", low):
+            return True
+    return False
+
+
+def is_title_excluded(title, channel):
+    low = title.lower()
+    for word in cfg.TITLE_EXCLUDE_BY_CHANNEL.get(channel, []):
+        if re.search(r"(?<!\w)" + re.escape(word) + r"(?!\w)", low):
             return True
     return False
 
@@ -243,6 +294,23 @@ def is_kids(title, size_title):
     if KIDS_RE.search(title + " " + size_text):
         return True
     return bool(KIDS_SIZE_RE.search(size_text))
+
+
+def is_accessory_listing(title, channel):
+    """True for accessories (case, strap, laces...) listed on their own.
+    Something sold WITH one ("with charger", "+ case", "no box") is fine."""
+    regex = ACCESSORY_RES.get(channel)
+    if regex is None:
+        return False
+    low = title.lower()
+    for m in regex.finditer(low):
+        if re.search(r"\bfor\b", low[m.end():]):
+            return True
+        prefix = low[max(0, m.start() - 25): m.start()]
+        if BUNDLE_RE.search(prefix) or any(ch in prefix for ch in "+&,"):
+            continue
+        return True
+    return False
 
 
 def brand_ok(channel, text):
@@ -279,6 +347,17 @@ def size_ok(kind, size_title, text):
             return True
         return any(t in cfg.TOPS for t in re.findall(r"[a-z]+", s))
 
+    if kind == "football":
+        own = (size_title or "").lower()
+        if own:
+            if re.search(r"\b(xxl|xxxl|2xl|3xl|xs|xxs)\b", own):
+                return False
+            if "extra large" in own:
+                return True
+            return any(t in cfg.FOOTBALL_SIZES for t in re.findall(r"[a-z]+", own))
+        # no size field: only trust clear size words in the text
+        return any(w in text.lower() for w in ("small", "medium", "large", " xl"))
+
     if kind == "bottoms":
         lo, hi = cfg.BOTTOM_RANGE
         return any(lo <= int(n) <= hi for n in re.findall(r"\d+", s))
@@ -286,10 +365,34 @@ def size_ok(kind, size_title, text):
     if kind == "shoes":
         lo, hi = cfg.SHOE_RANGE
         m = re.search(r"uk\s*(\d+(?:\.\d+)?)", s)
-        nums = [float(m.group(1))] if m else [float(n) for n in re.findall(r"\d+(?:\.\d+)?", s)]
-        return any(lo <= n <= hi for n in nums)
+        if m:
+            candidates = [float(m.group(1))]
+        else:
+            candidates = []
+            for n in re.findall(r"\d+(?:\.\d+)?", s):
+                v = float(n)
+                if v >= 35:                 # an EU size: convert to UK (EU 43 = UK 9)
+                    candidates.append(v - 34)
+                elif v <= 15:
+                    candidates.append(v)
+        return any(lo <= c <= hi for c in candidates)
 
     return True
+
+
+def football_era(text):
+    """Returns a note if the shirt looks 90s/00s or has a classic sponsor, else None.
+    Modern seasons (2010 and later) are skipped."""
+    vint = FOOTBALL_VINTAGE_RE.search(text)
+    modern = FOOTBALL_MODERN_RE.search(text)
+    if modern and not vint:
+        return None
+    if vint:
+        return "ERA: " + vint.group(0).lower()
+    sponsor = FOOTBALL_SPONSOR_RE.search(text)
+    if sponsor:
+        return "CLASSIC SPONSOR: " + sponsor.group(1).lower()
+    return None
 
 
 # ---------------------------------------------------------------
@@ -320,10 +423,11 @@ def seller_ok(seller):
 
 
 # ---------------------------------------------------------------
-# tiers (model recognition), rare words, authentic claims, sold link
+# tiers (model recognition), rare words, sold link, offers
 # ---------------------------------------------------------------
 def apply_tier(channel, title, resell, max_buy, postage):
-    """The most SPECIFIC matching model word wins; a tier only ever raises the price."""
+    """The most SPECIFIC matching model word wins; a tier only ever raises the price.
+    Returns (resell, max_buy, tier_word_if_raised, model_name)."""
     low = title.lower()
     best, best_spec = None, -1
     for tier in cfg.MODEL_TIERS.get(channel, []):
@@ -333,24 +437,18 @@ def apply_tier(channel, title, resell, max_buy, postage):
         spec = max(len(w) for w in matched)
         if spec > best_spec or (spec == best_spec and best is not None and tier["resell"] > best["resell"]):
             best, best_spec = tier, spec
-    if best and float(best["resell"]) > resell:
+    if not best:
+        return resell, max_buy, None, None
+    model_name = best["words"][0]
+    if float(best["resell"]) > resell:
         tier_max = best.get("max_buy") or cfg.max_buy_for(float(best["resell"]), channel, postage)
-        return float(best["resell"]), max(max_buy, float(tier_max)), best["words"][0]
-    return resell, max_buy, None
+        return float(best["resell"]), max(max_buy, float(tier_max)), model_name, model_name
+    return resell, max_buy, None, model_name
 
 
 def find_vintage(text):
     m = VINTAGE_RE.search(text)
     return m.group(1).lower() if m else None
-
-
-def find_authentic(text):
-    for m in AUTH_RE.finditer(text):
-        prefix = text[max(0, m.start() - 30): m.start()]
-        if NEGATION_RE.search(prefix):
-            continue
-        return m.group(1).lower()
-    return None
 
 
 def find_rare(channel, text):
@@ -379,21 +477,19 @@ def suggest_offer(price):
 # ---------------------------------------------------------------
 # discord
 # ---------------------------------------------------------------
-def post_text(channel, text):
-    webhook = cfg.get_webhook(channel)
+def post_payload(destination, payload, mentions=None):
+    webhook = cfg.get_webhook(destination)
     if not webhook:
-        print("[WARN] No webhook secret set for " + channel)
+        print("[WARN] No webhook secret set for " + destination)
         return False
 
-    payload = {
-        "username": "Deal Hunter",
-        "content": text[:1900],
-        "allowed_mentions": {"parse": []},
-    }
+    body = dict(payload)
+    body["username"] = "Deal Hunter"
+    body["allowed_mentions"] = mentions or {"parse": []}
     r = None
     for attempt in range(3):
         try:
-            r = requests.post(webhook, json=payload, timeout=15)
+            r = requests.post(webhook, json=body, timeout=15)
         except requests.RequestException as e:
             print("[WARN] Discord request failed: " + str(e)[:100])
             time.sleep(2)
@@ -401,22 +497,28 @@ def post_text(channel, text):
         if r.status_code in (200, 204):
             return True
         if r.status_code == 429:
-            time.sleep(float(r.headers.get("Retry-After", 2)))
+            try:
+                wait = float(r.headers.get("Retry-After", 2))
+            except ValueError:
+                wait = 2
+            time.sleep(wait)
             continue
         break
-    print("[ERROR] Discord status " + str(r.status_code if r is not None else "none") + " for #" + channel)
+    print("[ERROR] Discord status " + str(r.status_code if r is not None else "none") + " for #" + destination)
     return False
 
 
-def send_alert(d):
+def post_text(destination, text):
+    return post_payload(destination, {"content": text[:1900]})
+
+
+def build_single_embed(d):
     flags = []
     if d.get("era_note"):
         flags.append(d["era_note"])
     if d.get("alert_under") is not None:
         flags.append("ALERT RULE: " + POUND + format(float(d["alert_under"]), ".0f")
                      + " or less, profit rules skipped")
-    if d.get("auth_word"):
-        flags.append("SELLER SAYS: " + d["auth_word"] + " (a claim only, still verify)")
     if d["tier_word"]:
         flags.append("MODEL: " + d["tier_word"])
     if d["rare_word"]:
@@ -424,42 +526,131 @@ def send_alert(d):
     if d["resell"] > 0 and d["price"] <= d["resell"] * 0.5:
         flags.append("UNDERPRICED: asking " + str(int(round(100 * d["price"] / d["resell"])))
                      + "% of my resell estimate")
+    if d.get("market_note"):
+        flags.append(d["market_note"])
     if d["misspelled"]:
         flags.append("MISSPELLED LISTING - double check it is genuine")
-    if d["seller_deals"] > 1:
-        flags.append("Seller has " + str(d["seller_deals"]) + " deals this run - ask for a bundle price")
 
-    lines = [
-        "\U0001F525 **" + d["title"] + "**",
-        "Ask: **" + POUND + format(d["price"], ".2f") + "**  |  Resell: " + POUND + format(d["resell"], ".2f"),
-    ]
+    lines = ["Ask: **" + money(d["price"]) + "**  |  Resell: " + money(d["resell"])]
     if d["offer"] is not None:
-        lines.append("Profit at asking: **+" + POUND + format(d["net_profit"], ".2f") + "**  |  With offer ("
-                     + POUND + format(d["offer"], ".2f") + "): **+" + POUND + format(d["profit_offer"], ".2f")
-                     + "** \U0001F4B0")
-        lines.append("\U0001F91D " + cfg.OFFER_MESSAGE.replace("{offer}", POUND + format(d["offer"], ".2f")))
+        lines.append("Profit at asking: **+" + money(d["net_profit"]) + "**  |  With offer ("
+                     + money(d["offer"]) + "): **+" + money(d["profit_offer"]) + "** \U0001F4B0")
+        lines.append("\U0001F91D " + cfg.OFFER_MESSAGE.replace("{offer}", money(d["offer"])))
     else:
-        lines.append("Profit: **+" + POUND + format(d["net_profit"], ".2f") + "** \U0001F4B0")
+        lines.append("Profit: **+" + money(d["net_profit"]) + "** \U0001F4B0")
     if flags:
         lines.append("\U0001F3AF " + "  |  ".join(flags))
     lines.append("\U0001F50D " + cfg.CHECKLISTS.get(d["channel"], "Inspect tags and stitching carefully"))
     if d["seller_login"]:
         lines.append("Seller: " + str(d["seller_login"]))
-    lines.append(d["url"])
-    lines.append("Sold comps on eBay: <" + sold_link(d["title"]) + ">")
 
-    ok = post_text(d["channel"], "\n".join(lines))
+    links = ["[\U0001F6D2 Open on Vinted](" + d["url"] + ")"]
+    lens = lens_link(d.get("image"))
+    if lens:
+        links.append(lens)
+    links.append("[\U0001F4C8 eBay sold comps](" + sold_link(d["title"]) + ")")
+    lines.append("  |  ".join(links))
+
+    tag = cfg.CATEGORY_TAG.get(d["channel"], "")
+    embed = {
+        "title": (tag + " " + d["title"]).strip()[:250],
+        "url": d["url"],
+        "color": cfg.CATEGORY_COLOUR.get(d["channel"], 0x95A5A6),
+        "description": "\n".join(lines)[:4000],
+        "footer": {"text": "Deal Hunter"},
+    }
+    if d.get("image"):
+        embed["image"] = {"url": d["image"]}
+    return embed
+
+
+def build_bundle_embeds(deals):
+    deals = sorted(deals, key=lambda x: x["net_profit"], reverse=True)
+    shown = deals[:cfg.BUNDLE_MAX_ITEMS_SHOWN]
+    seller = deals[0]["seller_login"] or "unknown"
+    total_ask = sum(x["price"] for x in deals)
+    total_profit = sum(x["net_profit"] for x in deals)
+
+    lines = [
+        "Seller: **" + str(seller) + "**  |  " + str(len(deals)) + " items  |  Total ask: **"
+        + money(total_ask) + "**  |  Total profit: **+" + money(total_profit) + "** \U0001F4B0",
+        "\U0001F4AC Ask the seller for a bundle price before buying one by one!",
+        "",
+    ]
+    for i, x in enumerate(shown, 1):
+        tag = cfg.CATEGORY_TAG.get(x["channel"], "")
+        lines.append(str(i) + ". **" + tag + "** [" + clean_title(x["title"])[:70] + "](" + x["url"] + ")")
+        row = "    " + money(x["price"]) + " ask  |  resell " + money(x["resell"]) + "  |  profit **+" + money(x["net_profit"]) + "**"
+        lens = lens_link(x.get("image"))
+        if lens:
+            row += "  |  " + lens
+        lines.append(row)
+    if len(deals) > len(shown):
+        lines.append("+ " + str(len(deals) - len(shown)) + " more items from this seller")
+
+    main = {
+        "title": "\U0001F4E6 MULTI-ITEM WARDROBE DROP",
+        "url": shown[0]["url"],
+        "color": cfg.BUNDLE_COLOUR,
+        "description": "\n".join(lines)[:3900],
+        "footer": {"text": "Deal Hunter"},
+    }
+    embeds = [main]
+    if shown[0].get("image"):
+        main["image"] = {"url": shown[0]["image"]}
+        # gallery trick: extra embeds with the SAME url merge into one photo grid
+        for x in shown[1:cfg.BUNDLE_GALLERY_IMAGES]:
+            if x.get("image"):
+                embeds.append({"url": shown[0]["url"], "image": {"url": x["image"]}})
+    return embeds
+
+
+def send_single(d):
+    dest = cfg.destination_for(d["channel"])
+    content = ""
+    mentions = None
+    if d.get("ping") and dest == "mertra":
+        content = cfg.PING_TEXT
+        mentions = {"parse": ["everyone"]}
+    ok = post_payload(dest, {"content": content, "embeds": [build_single_embed(d)]}, mentions)
     if ok:
-        print("[SENT] #" + d["channel"] + ": " + d["title"])
+        print("[SENT] #" + dest + ": " + d["title"])
     return ok
+
+
+def send_bundle(deals):
+    dests = []
+    for x in deals:
+        dest = cfg.destination_for(x["channel"])
+        if dest not in dests:
+            dests.append(dest)
+    # a bundle with a Mertra / North Face item also goes to the sniper channel
+    if "mertra" in dests and "sniper" not in dests:
+        dests.append("sniper")
+
+    any_ping = any(x.get("ping") for x in deals)
+    embeds = build_bundle_embeds(deals)
+    ok_any = False
+    for dest in dests:
+        content = ""
+        mentions = None
+        if any_ping and dest == "mertra":
+            content = cfg.PING_TEXT
+            mentions = {"parse": ["everyone"]}
+        if post_payload(dest, {"content": content, "embeds": embeds}, mentions):
+            ok_any = True
+            print("[SENT] BUNDLE #" + dest + ": " + str(len(deals)) + " items from " + str(deals[0]["seller_login"]))
+        time.sleep(1)
+    return ok_any
 
 
 # ---------------------------------------------------------------
 # daily summary (stored in stats.json)
 # ---------------------------------------------------------------
-STAT_KEYS = ["checked", "already_alerted", "relist_blocked", "kids", "brand_mismatch",
-             "keyword_missing", "modern_skipped", "condition_flags", "junk_or_size",
-             "seller_filtered", "price_out_of_range", "low_profit", "qualified", "sent", "errors"]
+STAT_KEYS = ["checked", "already_alerted", "relist_blocked", "kids", "accessory_blocked",
+             "brand_mismatch", "keyword_missing", "modern_skipped", "condition_flags",
+             "junk_or_size", "seller_filtered", "price_out_of_range", "low_profit",
+             "qualified", "sent", "bundles", "errors"]
 
 
 def new_day_stats(day):
@@ -477,18 +668,20 @@ def maybe_send_daily_summary(day_stats):
         "\U0001F4CA **Deal Hunter daily summary for " + str(g("day")) + "**",
         "Runs: " + str(g("runs", 0)) + " (should be about 24)",
         "Listings checked: " + str(g("checked", 0)),
-        "Blocked: kids " + str(g("kids", 0)) + ", wrong brand " + str(g("brand_mismatch", 0))
+        "Blocked: kids " + str(g("kids", 0)) + ", accessories " + str(g("accessory_blocked", 0))
+        + ", wrong brand " + str(g("brand_mismatch", 0))
         + ", condition " + str(g("condition_flags", 0)) + ", junk/size " + str(g("junk_or_size", 0))
         + ", sellers " + str(g("seller_filtered", 0)),
         "Repeat protection: already alerted " + str(g("already_alerted", 0))
         + ", relists blocked " + str(g("relist_blocked", 0)),
         "Too expensive: " + str(g("price_out_of_range", 0)) + ", profit too low: " + str(g("low_profit", 0)),
-        "Deals found: " + str(g("qualified", 0)) + ", alerts sent: " + str(g("sent", 0)),
+        "Deals found: " + str(g("qualified", 0)) + ", messages sent: " + str(g("sent", 0))
+        + " (wardrobe bundles: " + str(g("bundles", 0)) + ")",
     ]
     if g("keyword_missing", 0):
-        lines.append("Skipped (not the wanted type, e.g. NF non-puffers): " + str(g("keyword_missing", 0)))
+        lines.append("Skipped (not the wanted type): " + str(g("keyword_missing", 0)))
     if g("modern_skipped", 0):
-        lines.append("Modern items skipped (no_modern searches): " + str(g("modern_skipped", 0)))
+        lines.append("Modern / wrong era skipped: " + str(g("modern_skipped", 0)))
     if g("errors", 0):
         lines.append("Listings that errored and were skipped: " + str(g("errors", 0)))
     if g("best_title"):
@@ -518,17 +711,17 @@ def run():
     deals = []
     queued = set()
     queued_fps = set()
+    market = {}                 # (category, model) -> {item id: price}, for the live price check
     near_misses = []
     stats = {k: 0 for k in STAT_KEYS}
     stats["already_seen"] = 0
     stats["seller_data"] = 0
     searches_total = 0
     searches_with_results = 0
-    debug_printed = False
 
-    for ch in sorted(cfg.ENABLED_CHANNELS):
-        found = "yes" if cfg.get_webhook(ch) else "NO - secret missing or name mismatch"
-        print("[CHECK] Webhook for " + ch + ": " + found)
+    for dest in sorted(cfg.WEBHOOK_SECRETS):
+        found = "yes" if cfg.get_webhook(dest) else "NO - secret missing or name mismatch"
+        print("[CHECK] Webhook for " + dest + ": " + found)
 
     # rotate the start point every hour so, if time runs short, different searches get skipped
     targets = [t for t in cfg.TARGETS if t["channel"] in cfg.ENABLED_CHANNELS]
@@ -550,6 +743,7 @@ def run():
             must_match = t.get("must_match")
             misspelled = bool(t.get("misspelled"))
             require_any = t.get("require_any")
+            ping_under = to_float(t.get("ping_under"))
             max_items = int(t.get("items", cfg.ITEMS_PER_SEARCH))
 
             print("\n[SEARCH] " + query)
@@ -558,14 +752,9 @@ def run():
 
             if not items:
                 print("[WARN] 0 items (possible block or empty search)")
-                time.sleep(3)
+                time.sleep(2)
                 continue
             searches_with_results += 1
-
-            if not debug_printed:
-                print("[DEBUG] listing fields: " + ", ".join(describe_fields(items[0])))
-                print("[DEBUG] seller fields: " + ", ".join(describe_fields(field(items[0], "user"))))
-                debug_printed = True
 
             for item in items[:max_items]:
                 try:
@@ -597,13 +786,19 @@ def run():
                     if must_match and not any(m in title.lower() for m in must_match):
                         continue
 
+                    # rejections below that depend on THIS search are not remembered,
+                    # so another search (different size, type or limit) can still pick the listing up
                     if require_any and not has_any_word(text, require_any):
                         stats["keyword_missing"] += 1
-                        seen[item_id] = today
                         continue
 
                     if is_kids(title, size_title):
                         stats["kids"] += 1
+                        seen[item_id] = today
+                        continue
+
+                    if channel in cfg.ACCESSORY_WORDS_BY_CHANNEL and is_accessory_listing(title, channel):
+                        stats["accessory_blocked"] += 1
                         seen[item_id] = today
                         continue
 
@@ -617,9 +812,22 @@ def run():
                         seen[item_id] = today
                         continue
 
-                    if is_banned(text, channel) or not size_ok(kind, size_title, text):
+                    if is_banned(text, channel) or is_title_excluded(title, channel):
                         stats["junk_or_size"] += 1
                         seen[item_id] = today
+                        continue
+
+                    # football shirts: must look 90s/00s (or have a classic sponsor)
+                    era_note = None
+                    if channel == "football":
+                        era_note = football_era(text)
+                        if not era_note:
+                            stats["modern_skipped"] += 1
+                            seen[item_id] = today
+                            continue
+
+                    if not size_ok(kind, size_title, text):
+                        stats["junk_or_size"] += 1
                         continue
 
                     seller = get_seller(item)
@@ -630,21 +838,16 @@ def run():
                         seen[item_id] = today
                         continue
 
-                    resell, max_buy, tier_word = apply_tier(channel, title, base_resell, base_max, postage)
+                    resell, max_buy, tier_word, model_name = apply_tier(channel, title, base_resell, base_max, postage)
+                    if model_name:
+                        market.setdefault((channel, model_name), {})[item_id] = price
 
                     # vintage vs modern pricing (Carhartt + Dickies only)
-                    era_note = None
                     is_modern = False
                     if channel in cfg.MODERN_RESELL_FACTOR:
                         vintage_word = find_vintage(text)
                         if vintage_word:
-                            v_factor = cfg.VINTAGE_RESELL_FACTOR.get(channel, 1.0)
-                            if v_factor != 1.0:
-                                resell = resell * v_factor
-                                max_buy = cfg.max_buy_for(resell, channel, postage)
                             era_note = "VINTAGE: " + vintage_word
-                            if v_factor != 1.0:
-                                era_note += ", resell at " + str(int(round(v_factor * 100))) + "%"
                         else:
                             is_modern = True
                             factor = cfg.MODERN_RESELL_FACTOR[channel]
@@ -654,13 +857,16 @@ def run():
 
                     if is_modern and t.get("no_modern"):
                         stats["modern_skipped"] += 1
-                        seen[item_id] = today
                         continue
 
+                    # untested cameras: allowed, but priced lower
+                    if channel in cfg.UNTESTED_RESELL_FACTOR and UNTESTED_RE.search(text):
+                        factor = cfg.UNTESTED_RESELL_FACTOR[channel]
+                        resell = resell * factor
+                        max_buy = cfg.max_buy_for(resell, channel, postage)
+                        era_note = "UNTESTED: resell cut to " + str(int(round(factor * 100))) + "%"
+
                     rare_word = find_rare(channel, text)
-                    auth_word = None
-                    if channel in cfg.AUTHENTIC_BONUS_CHANNELS:
-                        auth_word = find_authentic(text)
 
                     alert_under = t.get("alert_under")
                     if alert_under is not None:
@@ -673,21 +879,14 @@ def run():
                         need_profit = cfg.MIN_PROFIT_BY_CHANNEL.get(channel, cfg.MIN_NET_PROFIT)
                         need_roi = cfg.ROI_BY_CHANNEL.get(channel, cfg.MIN_ROI)
 
-                    if auth_word and alert_under is None:
-                        max_buy = max_buy * cfg.AUTHENTIC_MAX_BUY_MULTIPLIER
-                        need_profit = min(need_profit, cfg.RARE_MIN_NET_PROFIT)
-                        need_roi = min(need_roi, cfg.RARE_MIN_ROI)
-
                     if not (min_buy <= price <= max_buy):
                         stats["price_out_of_range"] += 1
-                        seen[item_id] = today
                         continue
 
                     net_profit = resell * (1 - cfg.RESELL_FEE_PCT) - price - postage
                     if need_profit is not None and (net_profit < need_profit or net_profit < price * need_roi):
                         stats["low_profit"] += 1
                         near_misses.append((net_profit, title, price))
-                        seen[item_id] = today
                         continue
 
                     # repeat protection: the same seller + title was already alerted (a relist)
@@ -702,27 +901,28 @@ def run():
                     if offer is not None:
                         profit_offer = resell * (1 - cfg.RESELL_FEE_PCT) - offer - postage
 
+                    ping = bool(ping_under is not None and price <= ping_under)
+
                     stats["qualified"] += 1
                     queued.add(item_id)
                     if fp:
                         queued_fps.add(fp)
                     deals.append({
                         "id": item_id, "title": title, "price": price,
-                        "url": full_url(field(item, "url")), "resell": resell,
-                        "net_profit": net_profit, "channel": channel,
-                        "tier_word": tier_word, "rare_word": rare_word,
+                        "url": full_url(field(item, "url")), "image": get_image_url(item),
+                        "resell": resell, "net_profit": net_profit, "channel": channel,
+                        "tier_word": tier_word, "model": model_name, "rare_word": rare_word,
                         "misspelled": misspelled,
                         "seller_login": seller["login"], "seller_id": seller["id"],
-                        "seller_deals": 1,
                         "offer": offer, "profit_offer": profit_offer,
-                        "era_note": era_note, "alert_under": alert_under, "auth_word": auth_word,
-                        "fp": fp,
+                        "era_note": era_note, "alert_under": alert_under,
+                        "market_note": None, "fp": fp, "ping": ping,
                     })
                 except Exception as e:
                     stats["errors"] += 1
                     print("[WARN] Skipped one listing because of an error: " + str(e)[:120])
 
-            time.sleep(3)
+            time.sleep(2)
 
         # health check: every search empty means Vinted is probably blocking us
         if searches_total > 0 and searches_with_results == 0:
@@ -733,51 +933,72 @@ def run():
                           "Vinted may be blocking GitHub's servers. I will keep trying every hour.")
                 day["block_alerted"] = True
 
-        # bundle tip: count deals per seller
-        per_seller = {}
+        # live price check: compare each deal with the middle price of the same model seen this run
+        for d in deals:
+            prices = list(market.get((d["channel"], d["model"]), {}).values()) if d["model"] else []
+            if len(prices) >= cfg.MARKET_MIN_LISTINGS:
+                mid = statistics.median(prices)
+                if mid > 0 and d["price"] <= cfg.MARKET_UNDERPRICED_RATIO * mid:
+                    d["market_note"] = ("CHEAP VS VINTED: asking " + str(int(round(100 * d["price"] / mid)))
+                                        + "% of the typical price for this model (" + str(len(prices)) + " listings seen)")
+
+        # wardrobe bundles: same seller with 2+ matching items = ONE gold embed
+        units = []
+        by_seller = {}
         for d in deals:
             key = d["seller_id"] or d["seller_login"]
             if key:
-                per_seller[key] = per_seller.get(key, 0) + 1
-        for d in deals:
-            key = d["seller_id"] or d["seller_login"]
-            if key:
-                d["seller_deals"] = per_seller[key]
+                by_seller.setdefault(str(key), []).append(d)
+            else:
+                units.append({"type": "single", "deals": [d]})
+        for key, group in by_seller.items():
+            if len(group) >= cfg.BUNDLE_MIN_ITEMS:
+                units.append({"type": "bundle", "deals": group})
+            else:
+                units.append({"type": "single", "deals": group})
+        for u in units:
+            u["profit"] = sum(x["net_profit"] for x in u["deals"])
+        units.sort(key=lambda u: u["profit"], reverse=True)
 
-        def rank(d):
-            return d["net_profit"] + (cfg.AUTHENTIC_RANK_BONUS if d.get("auth_word") else 0.0)
-
-        deals.sort(key=rank, reverse=True)
         to_send = []
         per_channel = {}
-        for d in deals:
+        for u in units:
             if len(to_send) >= cfg.MAX_ALERTS_PER_RUN:
                 break
-            limit = cfg.MAX_ALERTS_BY_CHANNEL.get(d["channel"], cfg.MAX_ALERTS_PER_CHANNEL)
-            if per_channel.get(d["channel"], 0) >= limit:
-                continue
-            per_channel[d["channel"]] = per_channel.get(d["channel"], 0) + 1
-            to_send.append(d)
+            if u["type"] == "single":
+                d = u["deals"][0]
+                limit = cfg.MAX_ALERTS_BY_CHANNEL.get(d["channel"], cfg.MAX_ALERTS_PER_CHANNEL)
+                if per_channel.get(d["channel"], 0) >= limit:
+                    continue
+                per_channel[d["channel"]] = per_channel.get(d["channel"], 0) + 1
+            to_send.append(u)
 
         sent = 0
-        for d in to_send:
-            if send_alert(d):
-                # remember it FOREVER (180 days) the moment it is sent, and save straight away
-                seen[d["id"]] = today
-                alerted["ids"][d["id"]] = today
-                if d["fp"]:
-                    alerted["fps"][d["fp"]] = today
+        for u in to_send:
+            if u["type"] == "bundle":
+                ok = send_bundle(u["deals"])
+            else:
+                ok = send_single(u["deals"][0])
+            if ok:
+                # remember every item FOREVER (180 days) the moment it is sent, and save straight away
+                for d in u["deals"]:
+                    seen[d["id"]] = today
+                    alerted["ids"][d["id"]] = today
+                    if d["fp"]:
+                        alerted["fps"][d["fp"]] = today
+                    if d["net_profit"] > day.get("best_profit", 0.0):
+                        day["best_profit"] = d["net_profit"]
+                        day["best_title"] = d["title"]
                 save_state(seen, alerted, day)
                 sent += 1
-                if d["net_profit"] > day.get("best_profit", 0.0):
-                    day["best_profit"] = d["net_profit"]
-                    day["best_title"] = d["title"]
+                if u["type"] == "bundle":
+                    stats["bundles"] += 1
             time.sleep(1)
         stats["sent"] = sent
 
-        held = len(deals) - len(to_send)
-        if held > 0:
-            print("[INFO] " + str(held) + " more qualifying deals held for next run")
+        held_deals = sum(len(u["deals"]) for u in units) - sum(len(u["deals"]) for u in to_send)
+        if held_deals > 0:
+            print("[INFO] " + str(held_deals) + " more qualifying deals held for next run")
 
         day["runs"] = day.get("runs", 0) + 1
         for k in STAT_KEYS:
@@ -789,19 +1010,18 @@ def run():
         print("Relists blocked:         " + str(stats["relist_blocked"]))
         print("Already seen (skipped):  " + str(stats["already_seen"]))
         print("Kids items blocked:      " + str(stats["kids"]))
+        print("Accessories blocked:     " + str(stats["accessory_blocked"]))
         print("Wrong brand blocked:     " + str(stats["brand_mismatch"]))
         print("Not the wanted type:     " + str(stats["keyword_missing"]))
-        print("Modern items skipped:    " + str(stats["modern_skipped"]))
+        print("Modern / wrong era:      " + str(stats["modern_skipped"]))
         print("Condition red flags:     " + str(stats["condition_flags"]))
         print("Junk word / wrong size:  " + str(stats["junk_or_size"]))
         print("Seller filtered:         " + str(stats["seller_filtered"]))
         print("Price out of range:      " + str(stats["price_out_of_range"]))
         print("Profit too low:          " + str(stats["low_profit"]))
         print("Qualified deals:         " + str(stats["qualified"]))
-        print("Alerts sent to Discord:  " + str(stats["sent"]))
+        print("Messages sent:           " + str(stats["sent"]) + " (bundles: " + str(stats["bundles"]) + ")")
         print("Errors (skipped items):  " + str(stats["errors"]))
-        print("Listings with seller rating data: " + str(stats["seller_data"])
-              + " (0 means Vinted gave no ratings, so the rating filter is inactive)")
 
         if near_misses:
             near_misses.sort(reverse=True)
