@@ -1,14 +1,42 @@
 import datetime
-import io
-import json
-import re
-import statistics
+import os
 import sys
-import time
-import urllib.parse
+from zoneinfo import ZoneInfo
 
-import requests
-from vinted_scraper import VintedScraper
+
+# ---------------------------------------------------------------
+# UK TIME GATE (runs before anything else)
+# GitHub's cron runs in UTC, so the UK rules are enforced here (GMT/BST safe):
+#   * never run from 23:00 to 04:59 UK time (also catches delayed GitHub queues)
+#   * the extra ":30" run (cron '30 17-20 * * *') only counts from 18:00 to 20:59 UK time
+# Manual "Run workflow" clicks skip the check so you can test at any time.
+# ---------------------------------------------------------------
+def uk_time_gate():
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        print("[SCHEDULE] Manual run - quiet-hours check skipped.")
+        return
+    uk = datetime.datetime.now(ZoneInfo("Europe/London"))
+    if uk.hour >= 23 or uk.hour < 5:
+        print("[SCHEDULE] UK time is " + uk.strftime("%H:%M") + " (quiet hours 23:00-04:59). Exiting.")
+        sys.exit(0)
+    schedule = os.environ.get("CRON_SCHEDULE", "").split()
+    if schedule and schedule[0] == "30" and not (18 <= uk.hour <= 20):
+        print("[SCHEDULE] Half-hour run outside 18:00-20:59 UK time (" + uk.strftime("%H:%M") + "). Exiting.")
+        sys.exit(0)
+    print("[SCHEDULE] UK time " + uk.strftime("%H:%M") + " - running.")
+
+
+uk_time_gate()
+
+import io  # noqa: E402
+import json  # noqa: E402
+import re  # noqa: E402
+import statistics  # noqa: E402
+import time  # noqa: E402
+import urllib.parse  # noqa: E402
+
+import requests  # noqa: E402
+from vinted_scraper import VintedScraper  # noqa: E402
 
 try:
     from PIL import Image, ImageOps
@@ -18,7 +46,7 @@ except ImportError:
     PIL_OK = False
     RESAMPLE = None
 
-import config as cfg
+import config as cfg  # noqa: E402
 
 # UK ONLY: the scraper only ever talks to vinted.co.uk
 BASE_URL = "https://www.vinted.co.uk"
@@ -27,6 +55,41 @@ UK_HOST = "vinted.co.uk"
 # (it is still blocked if currency/country is shown and is NOT GBP / United Kingdom).
 # True = block anything that cannot be PROVEN to be UK.
 UK_REQUIRE_COUNTRY_PROOF = False
+
+# Fast Buy link. {item_id} is replaced with the listing id.
+# If Vinted changes its checkout link, change it here (one line).
+FAST_BUY_URL = "https://www.vinted.co.uk/transaction/buy/new?source_screen=item&transaction%5Bitem_id%5D={item_id}"
+
+# CONDITION FILTER: only these Vinted condition labels are allowed per category
+# (lower case, "contains" match). "very good" = great condition,
+# "new with tags" / "new without tags" = like new. Add more categories if you want,
+# e.g. "football": [...]. Categories not listed here accept any condition.
+ALLOWED_CONDITIONS = {
+    "shoes": ["new with tags", "new without tags", "very good"],
+}
+# False = if Vinted does not show the condition, the deal is still sent with a warning flag.
+# True = block deals whose condition cannot be confirmed.
+BLOCK_UNKNOWN_CONDITION = False
+# Extra "worn out" phrases that block a listing (title + description), per category.
+EXTRA_CONDITION_FLAGS = {
+    "shoes": [
+        "worn condition", "used condition", "well worn", "very worn", "heavily worn", "worn out",
+        "scuffed", "scuffs", "beat up", "beaten", "sole wear", "heavy wear", "dirty",
+        "yellowing", "yellowed", "needs cleaning", "needs a clean", "heavy creasing", "heavily creased",
+    ],
+}
+
+# Used for the Tag & Era link when the listing has no brand
+CATEGORY_BRAND_FALLBACK = {
+    "carhartt": "Carhartt", "dickies": "Dickies", "ralph_lauren": "Ralph Lauren",
+    "football": "football shirt", "cameras": "camera", "patagonia": "Patagonia",
+    "shoes": "Nike", "mertra_tnf": "The North Face",
+}
+BRAND_DISPLAY = {
+    "ralph": "Ralph Lauren", "polo": "Polo Ralph Lauren", "tnf": "The North Face",
+    "northface": "The North Face", "newbalance": "New Balance", "carhart": "Carhartt",
+    "dickie": "Dickies", "rrl": "RRL", "double rl": "Double RL",
+}
 
 SEEN_FILE = "seen.json"
 ALERTED_FILE = "alerted.json"
@@ -60,6 +123,10 @@ UNTESTED_RE = re.compile(r"\b(" + "|".join(re.escape(w) for w in cfg.UNTESTED_WO
 ACCESSORY_RES = {
     ch: re.compile(r"\b(" + "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True)) + r")\b", re.I)
     for ch, words in cfg.ACCESSORY_WORDS_BY_CHANNEL.items()
+}
+EXTRA_CONDITION_RES = {
+    ch: re.compile(r"\b(" + "|".join(re.escape(w) for w in words) + r")\b", re.I)
+    for ch, words in EXTRA_CONDITION_FLAGS.items()
 }
 _banned_cache = {}
 
@@ -163,14 +230,86 @@ def text_field(item, *names):
     return None
 
 
+def nested_text(v):
+    """A text value that may be a plain string or a small object with a title/name."""
+    if isinstance(v, str):
+        return v.strip() or None
+    if v is not None and not isinstance(v, (int, float, bool, list, tuple)):
+        t = field(v, "title") or field(v, "name")
+        if isinstance(t, str) and t.strip():
+            return t.strip()
+    return None
+
+
+def get_brand(item):
+    for name in ("brand_title", "brand"):
+        t = nested_text(field(item, name))
+        if t:
+            return t
+    return None
+
+
+def get_size(item):
+    for name in ("size_title", "size"):
+        t = nested_text(field(item, name))
+        if t:
+            return t
+    return None
+
+
+def get_status(item):
+    for name in ("status", "condition"):
+        t = nested_text(field(item, name))
+        if t:
+            return t
+    return None
+
+
+def review_stats(user):
+    rep = to_float(field(user, "feedback_reputation"))
+    count = to_float(field(user, "feedback_count"))
+    if count is None:
+        parts = [to_float(field(user, k)) for k in
+                 ("positive_feedback_count", "neutral_feedback_count", "negative_feedback_count")]
+        if any(p is not None for p in parts):
+            count = sum(p or 0 for p in parts)
+    return rep, count
+
+
+def guess_brand(channel, text, use_fallback=False):
+    low = text.lower()
+    for w in cfg.BRAND_WORDS.get(channel, []):
+        if w in low:
+            return BRAND_DISPLAY.get(w, w.title())
+    return CATEGORY_BRAND_FALLBACK.get(channel) if use_fallback else None
+
+
+def guess_size(text):
+    m = re.search(r"\buk\s*(\d+(?:\.\d+)?)\b", text, re.I)
+    if m:
+        return "UK " + m.group(1)
+    m = re.search(r"\bsize\s*[:\-]?\s*(xxs|xs|s|m|l|xl|xxl|\d{2}(?:\.\d)?)\b", text, re.I)
+    if m:
+        return m.group(1).upper()
+    return None
+
+
 def lens_link(img):
     if not img:
         return None
     return "[\U0001F4F7 Google Lens](https://lens.google.com/uploadbyurl?url=" + urllib.parse.quote(img, safe="") + ")"
 
 
+def tag_era_link(d):
+    brand = (d.get("brand")
+             or guess_brand(d["channel"], d["title"] + " " + str(d.get("description") or ""), use_fallback=True)
+             or "vintage")
+    q = urllib.parse.quote_plus(brand + " vintage neck tag guide")
+    return "[\U0001F3F7\uFE0F Check Tag Era](https://www.google.com/search?tbm=isch&q=" + q + ")"
+
+
 def fast_buy_url(item_id):
-    return BASE_URL + "/transaction/buy/new?source_screen=item&transaction%5Bitem_id%5D=" + str(item_id)
+    return FAST_BUY_URL.replace("{item_id}", str(item_id))
 
 
 def wardrobe_url(seller_id):
@@ -203,6 +342,21 @@ def search_with_retry(query):
             print("[WARN] Search attempt " + str(attempt + 1) + " failed for '" + query + "': " + str(e)[:120])
             time.sleep(4 * (attempt + 1))
     return None
+
+
+def describe_fields(obj):
+    """Names of the fields on a scraper object (used for the one-time [DEBUG] log lines)."""
+    if obj is None:
+        return []
+    if isinstance(obj, dict):
+        return sorted(str(k) for k in obj.keys())
+    try:
+        return sorted(k for k in vars(obj).keys() if not str(k).startswith("_"))
+    except TypeError:
+        return sorted(n for n in dir(obj) if not n.startswith("_") and not callable(getattr(obj, n, None)))
+
+
+_debug_done = {"search": False, "detail": False}
 
 
 # ---------------------------------------------------------------
@@ -322,83 +476,139 @@ def seller_avatar(item):
 def extract_extras(item, price):
     fee, est = get_fee_info(item, price)
     user = field(item, "user")
+    rep, count = review_stats(user)
     return {
         "country": get_country(item),
         "photos": get_photo_urls(item),
         "created_ts": get_created_ts(item),
         "description": str(field(item, "description", "") or "").strip(),
         "fee": fee, "fee_estimated": est,
-        "rep": to_float(field(user, "feedback_reputation")),
-        "rep_count": to_float(field(user, "feedback_count")),
+        "rep": rep, "rep_count": count,
+        "brand": get_brand(item), "size": get_size(item), "status": get_status(item),
     }
 
 
 _detail_cache = {}
-_detail_state = {"fails": 0}
+_detail_state = {"fails": 0, "off_told": False}
+
+
+def unwrap_item(res):
+    if res is None:
+        return None
+    if isinstance(res, dict):
+        inner = res.get("item")
+        return inner if isinstance(inner, dict) else res
+    inner = getattr(res, "item", None)
+    if inner is not None and not callable(inner):
+        return inner
+    return res
+
+
+def looks_like_item(res):
+    return res is not None and bool(field(res, "id") or field(res, "title") or field(res, "description"))
+
+
+def call_detail(item_id):
+    """Tries the scraper's item lookup, then its raw API call."""
+    if hasattr(scraper, "item"):
+        try:
+            res = unwrap_item(scraper.item(item_id))
+            if looks_like_item(res):
+                return res
+        except Exception as e:
+            print("[WARN] item() lookup failed for " + str(item_id) + ": " + str(e)[:100])
+    if hasattr(scraper, "curl"):
+        try:
+            res = unwrap_item(scraper.curl("/api/v2/items/" + str(item_id)))
+            if looks_like_item(res):
+                return res
+        except Exception as e:
+            print("[WARN] curl lookup failed for " + str(item_id) + ": " + str(e)[:100])
+    return None
 
 
 def fetch_item_detail(item_id):
-    """Full listing lookup (cached). Returns None if the scraper cannot do it."""
+    """Full listing lookup (cached, with retries). Returns None if it cannot be fetched."""
     if item_id in _detail_cache:
         return _detail_cache[item_id]
-    if _detail_state["fails"] >= 3 or not hasattr(scraper, "item"):
+    if _detail_state["fails"] >= 6:
+        if not _detail_state["off_told"]:
+            print("[WARN] Item lookups switched off for the rest of this run (too many failures).")
+            _detail_state["off_told"] = True
         return None
     result = None
-    try:
-        res = scraper.item(item_id)
-        if isinstance(res, dict) and isinstance(res.get("item"), dict):
-            res = res["item"]
-        elif not isinstance(res, dict):
-            inner = getattr(res, "item", None)
-            if inner is not None and not callable(inner):
-                res = inner
-        if res:
-            result = res
-            _detail_state["fails"] = 0
-        else:
-            _detail_state["fails"] += 1
-    except Exception as e:
+    for attempt in range(2):
+        result = call_detail(item_id)
+        if result is not None:
+            break
+        time.sleep(2 * (attempt + 1))
+    if result is not None:
+        _detail_state["fails"] = 0
+        if not _debug_done["detail"]:
+            _debug_done["detail"] = True
+            print("[DEBUG] detail item fields: " + ", ".join(describe_fields(result)))
+            print("[DEBUG] detail seller fields: " + ", ".join(describe_fields(field(result, "user"))))
+    else:
         _detail_state["fails"] += 1
-        print("[WARN] Item lookup failed for " + str(item_id) + ": " + str(e)[:100])
-    if _detail_state["fails"] >= 3:
-        print("[WARN] Item lookups switched off for this run (the scraper could not fetch listings).")
     _detail_cache[item_id] = result
     time.sleep(1)
     return result
 
 
+def condition_allowed(channel, status):
+    allowed = ALLOWED_CONDITIONS.get(channel)
+    if not allowed:
+        return True
+    s = str(status or "").strip().lower()
+    if not s:
+        return not BLOCK_UNKNOWN_CONDITION
+    return any(a in s for a in allowed)
+
+
 def enrich_and_verify(d):
-    """Fills gaps from the full listing and confirms the seller is UK. Returns (ok, reason)."""
-    need = (d["country"] is None or len(d["photos"]) < 3 or d["created_ts"] is None
-            or not d["description"] or d["fee_estimated"])
-    if need:
-        detail = fetch_item_detail(d["id"])
-        if detail is not None:
-            cur = get_currency(detail)
-            if cur is not None and cur not in ("GBP", POUND):
-                return False, "currency " + cur
-            ex = extract_extras(detail, d["price"])
-            if d["country"] is None:
-                d["country"] = ex["country"]
-            if len(ex["photos"]) > len(d["photos"]):
-                d["photos"] = ex["photos"]
-            if d["created_ts"] is None:
-                d["created_ts"] = ex["created_ts"]
-            if not d["description"]:
-                d["description"] = ex["description"]
-            if d["fee_estimated"] and not ex["fee_estimated"]:
-                d["fee"], d["fee_estimated"] = ex["fee"], False
-            if d["rep"] is None:
-                d["rep"] = ex["rep"]
-            if d["rep_count"] is None:
-                d["rep_count"] = ex["rep_count"]
-            if not d.get("image") and d["photos"]:
-                d["image"] = d["photos"][0]
+    """Fills gaps from the full listing, confirms UK + condition. Returns (ok, reason, kind)."""
+    detail = fetch_item_detail(d["id"])
+    if detail is not None:
+        cur = get_currency(detail)
+        if cur is not None and cur not in ("GBP", POUND):
+            return False, "currency " + cur, "uk"
+        ex = extract_extras(detail, d["price"])
+        if d["country"] is None:
+            d["country"] = ex["country"]
+        if len(ex["photos"]) > len(d["photos"]):
+            d["photos"] = ex["photos"]
+        if d["created_ts"] is None:
+            d["created_ts"] = ex["created_ts"]
+        if not d["description"]:
+            d["description"] = ex["description"]
+        if d["fee_estimated"] and not ex["fee_estimated"]:
+            d["fee"], d["fee_estimated"] = ex["fee"], False
+        if d["rep"] is None:
+            d["rep"] = ex["rep"]
+        if d["rep_count"] is None:
+            d["rep_count"] = ex["rep_count"]
+        if not d.get("brand"):
+            d["brand"] = ex["brand"]
+        if not d.get("size"):
+            d["size"] = ex["size"]
+        if not d.get("status"):
+            d["status"] = ex["status"]
+        if not d.get("image") and d["photos"]:
+            d["image"] = d["photos"][0]
+
     if d["country"] is not None and not is_uk_country(d["country"]):
-        return False, "country " + str(d["country"])
+        return False, "country " + str(d["country"]), "uk"
     if d["country"] is None and UK_REQUIRE_COUNTRY_PROOF:
-        return False, "seller country unknown"
-    return True, None
+        return False, "seller country unknown", "uk"
+
+    ch = d["channel"]
+    if ch in ALLOWED_CONDITIONS:
+        if d.get("status"):
+            if not condition_allowed(ch, d["status"]):
+                return False, "condition '" + str(d["status"]) + "'", "condition"
+        elif BLOCK_UNKNOWN_CONDITION:
+            return False, "condition not shown", "condition"
+    return True, None, None
 
 
 # ---------------------------------------------------------------
@@ -654,6 +864,18 @@ def find_red_flag(text):
     return None
 
 
+def find_extra_condition_flag(text, channel):
+    regex = EXTRA_CONDITION_RES.get(channel)
+    if regex is None:
+        return None
+    for m in regex.finditer(text):
+        prefix = text[max(0, m.start() - 30): m.start()]
+        if NEGATION_RE.search(prefix):
+            continue
+        return m.group(1).lower()
+    return None
+
+
 def has_any_word(text, words):
     pattern = r"\b(" + "|".join(re.escape(w) for w in words) + r")\b"
     return bool(re.search(pattern, text, re.I))
@@ -808,6 +1030,34 @@ def deal_roi(d):
     return (d["net_profit"] / d["price"]) if d["price"] > 0 else 0.0
 
 
+def tier_label(profit):
+    for threshold, label in cfg.PROFIT_TIERS:
+        if profit >= threshold:
+            return label
+    return cfg.PROFIT_TIERS[-1][1]
+
+
+def score_stars(roi):
+    roi = max(roi, 0.0)
+    if roi >= 3.0:
+        n = 5
+    elif roi >= 2.0:
+        n = 4
+    elif roi >= 1.2:
+        n = 3
+    elif roi >= 0.8:
+        n = 2
+    else:
+        n = 1
+    return "\u2B50" * n + "\u2606" * (5 - n)
+
+
+def roi_bar(roi):
+    roi = max(roi, 0.0)
+    blocks = min(10, int(round(roi / 3.0 * 10)))
+    return "\u25B0" * blocks + "\u25B1" * (10 - blocks) + "  " + str(int(round(roi * 100))) + "%"
+
+
 def mk_field(name, value, inline=True):
     return {"name": name[:256], "value": (str(value) or "-")[:1024], "inline": inline}
 
@@ -884,6 +1134,7 @@ def build_single_embed(d, collage_ok):
     tag = cfg.CATEGORY_TAG.get(d["channel"], "")
     total = d["price"] + d["fee"]
     est = "~" if d["fee_estimated"] else ""
+    title_text = d["title"] + " " + str(d.get("description") or "")
 
     flags = []
     if d.get("era_note"):
@@ -904,20 +1155,32 @@ def build_single_embed(d, collage_ok):
         flags.append("MISSPELLED LISTING - double check it is genuine")
     if d.get("ping"):
         flags.append("BARGAIN PING")
+    if d["channel"] in ALLOWED_CONDITIONS and not d.get("status"):
+        flags.append("CONDITION NOT SHOWN - check the photos")
 
     desc_lines = []
     if d.get("hot"):
         desc_lines.append("**" + HOT_BANNER + "**")
+    desc_lines.append("**" + tier_label(d["net_profit"]) + "**  \u00B7  " + score_stars(roi) + "  deal score")
     desc_lines.append(short_desc(d.get("description")))
 
     published = "<t:" + str(d["created_ts"]) + ":R>" if d.get("created_ts") else "Unknown"
+
+    brand_text = d.get("brand")
+    if not brand_text:
+        g = guess_brand(d["channel"], title_text)
+        brand_text = (g + " (from title)") if g else "Not specified"
+    size_text = d.get("size")
+    if not size_text:
+        g = guess_size(title_text)
+        size_text = (g + " (from title)") if g else "Not specified"
 
     # the 6-field grid: two rows of three
     fields = [
         mk_field("\U0001F4B0 Price", format(d["price"], ".2f") + " " + POUND
                  + " (+ " + est + format(d["fee"], ".2f") + " " + POUND + ")"),
-        mk_field("\U0001F3F7\uFE0F Brand", d.get("brand") or "Not specified"),
-        mk_field("\U0001F4CF Size", d.get("size") or "Not specified"),
+        mk_field("\U0001F3F7\uFE0F Brand", brand_text),
+        mk_field("\U0001F4CF Size", size_text),
         mk_field("\u2728 Condition", d.get("status") or "Not specified"),
         mk_field("\u23F1\uFE0F Published", published),
         mk_field("\U0001F31F Reviews", reviews_text(d.get("rep"), d.get("rep_count"))),
@@ -931,11 +1194,12 @@ def build_single_embed(d, collage_ok):
     lens = lens_link(d.get("image"))
     if lens:
         links.append(lens)
+    links.append(tag_era_link(d))
     links.append("[\U0001F4C8 eBay Sold](" + sold_link(d["title"]) + ")")
     fields.append(mk_field("\U0001F517 Links", "  \u00B7  ".join(links), False))
 
-    profit_lines = ["Resell " + money(d["resell"]) + "  \u00B7  Profit **+" + money(d["net_profit"])
-                    + "**  \u00B7  ROI " + str(int(round(roi * 100))) + "%"]
+    profit_lines = [roi_bar(roi),
+                    "Resell " + money(d["resell"]) + "  \u00B7  Profit **+" + money(d["net_profit"]) + "**"]
     if d["offer"] is not None:
         profit_lines.append("\U0001F91D Offer " + money(d["offer"]) + " \u2192 profit +" + money(d["profit_offer"]))
         profit_lines.append("```" + cfg.OFFER_MESSAGE.replace("{offer}", money(d["offer"])) + "```")
@@ -1094,8 +1358,8 @@ def send_bundle(deals):
 # ---------------------------------------------------------------
 STAT_KEYS = ["checked", "already_alerted", "relist_blocked", "kids", "accessory_blocked",
              "brand_mismatch", "keyword_missing", "modern_skipped", "condition_flags",
-             "junk_or_size", "seller_filtered", "non_uk", "price_out_of_range", "low_profit",
-             "qualified", "sent", "bundles", "errors"]
+             "bad_condition", "junk_or_size", "seller_filtered", "non_uk", "price_out_of_range",
+             "low_profit", "qualified", "sent", "bundles", "errors"]
 
 
 def new_day_stats(day):
@@ -1123,11 +1387,12 @@ def maybe_send_daily_summary(day_stats):
         return
     g = day_stats.get
     lines = [
-        "Runs: **" + str(g("runs", 0)) + "** (should be about 24)",
+        "Runs: **" + str(g("runs", 0)) + "**",
         "Listings checked: **" + str(g("checked", 0)) + "**",
         "Blocked: kids " + str(g("kids", 0)) + ", accessories " + str(g("accessory_blocked", 0))
         + ", wrong brand " + str(g("brand_mismatch", 0))
-        + ", condition " + str(g("condition_flags", 0)) + ", junk/size " + str(g("junk_or_size", 0))
+        + ", condition " + str(g("condition_flags", 0)) + ", condition filter " + str(g("bad_condition", 0))
+        + ", junk/size " + str(g("junk_or_size", 0))
         + ", sellers " + str(g("seller_filtered", 0)) + ", non-UK " + str(g("non_uk", 0)),
         "Repeat protection: already alerted " + str(g("already_alerted", 0))
         + ", relists blocked " + str(g("relist_blocked", 0)),
@@ -1240,6 +1505,11 @@ def run():
                 continue
             searches_with_results += 1
 
+            if not _debug_done["search"]:
+                _debug_done["search"] = True
+                print("[DEBUG] search item fields: " + ", ".join(describe_fields(items[0])))
+                print("[DEBUG] search seller fields: " + ", ".join(describe_fields(field(items[0], "user"))))
+
             for item in items[:max_items]:
                 try:
                     item_id = str(field(item, "id", ""))
@@ -1298,8 +1568,16 @@ def run():
                         seen[item_id] = today
                         continue
 
-                    if cfg.CONDITION_CHECK_ENABLED and find_red_flag(text):
+                    if cfg.CONDITION_CHECK_ENABLED and (find_red_flag(text) or find_extra_condition_flag(text, channel)):
                         stats["condition_flags"] += 1
+                        seen[item_id] = today
+                        continue
+
+                    # condition filter: a KNOWN condition that is not allowed is blocked here
+                    # (unknown ones are checked again after the full listing is fetched)
+                    status_now = get_status(item)
+                    if status_now and not condition_allowed(channel, status_now):
+                        stats["bad_condition"] += 1
                         seen[item_id] = today
                         continue
 
@@ -1406,10 +1684,10 @@ def run():
                         "description": ex["description"] or desc.strip(),
                         "fee": ex["fee"], "fee_estimated": ex["fee_estimated"],
                         "country": ex["country"], "avatar": seller_avatar(item),
-                        "rep": seller["rep"], "rep_count": seller["count"],
-                        "size": size_title or text_field(item, "size"),
-                        "status": text_field(item, "status", "condition"),
-                        "brand": brand_field or None,
+                        "rep": ex["rep"], "rep_count": ex["rep_count"],
+                        "size": size_title or ex["size"],
+                        "status": ex["status"],
+                        "brand": brand_field or ex["brand"],
                         "resell": resell, "net_profit": net_profit, "channel": channel,
                         "tier_word": tier_word, "model": model_name, "rare_word": rare_word,
                         "misspelled": misspelled,
@@ -1430,7 +1708,7 @@ def run():
             if not day.get("block_alerted"):
                 post_text(cfg.SUMMARY_CHANNEL,
                           "\u26A0\uFE0F Deal Hunter: every Vinted search returned 0 results this run. "
-                          "Vinted may be blocking GitHub's servers. I will keep trying every hour.")
+                          "Vinted may be blocking GitHub's servers. I will keep trying.")
                 day["block_alerted"] = True
 
         # live price check: compare each deal with the middle price of the same model seen this run
@@ -1473,18 +1751,21 @@ def run():
                 per_channel[d["channel"]] = per_channel.get(d["channel"], 0) + 1
             to_send.append(u)
 
-        # final UK check + fill in the details (fee, publish time, photos) before anything is sent
+        # final UK + condition check, and fill in the details (fee, publish time, photos, reviews)
         verified = []
         for u in to_send:
             keep = []
             for d in u["deals"]:
-                ok, reason = enrich_and_verify(d)
+                ok, reason, kind_blocked = enrich_and_verify(d)
                 if ok:
                     keep.append(d)
                 else:
-                    stats["non_uk"] += 1
+                    if kind_blocked == "condition":
+                        stats["bad_condition"] += 1
+                    else:
+                        stats["non_uk"] += 1
                     seen[d["id"]] = today
-                    print("[UK ONLY] Blocked '" + d["title"][:50] + "': " + str(reason))
+                    print("[BLOCKED] '" + d["title"][:50] + "': " + str(reason))
             if not keep:
                 continue
             u["deals"] = keep
@@ -1539,6 +1820,7 @@ def run():
         print("Relists blocked:         " + str(stats["relist_blocked"]))
         print("Already seen (skipped):  " + str(stats["already_seen"]))
         print("Non-UK blocked:          " + str(stats["non_uk"]))
+        print("Condition filter blocked: " + str(stats["bad_condition"]))
         print("Kids items blocked:      " + str(stats["kids"]))
         print("Accessories blocked:     " + str(stats["accessory_blocked"]))
         print("Wrong brand blocked:     " + str(stats["brand_mismatch"]))
