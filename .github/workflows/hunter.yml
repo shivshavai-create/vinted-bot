@@ -2,7 +2,10 @@ name: Deal Hunter Workflow
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    # GitHub cron is always UTC. main.py checks the real UK time (GMT/BST safe) and
+    # exits outside your windows, so these two lines are deliberately a little wide:
+    - cron: '0 4-22 * * *'      # hourly, all active hours (UK 05:00-22:59)
+    - cron: '30 17-20 * * *'    # extra half-hour runs (kept only at UK 18:30, 19:30, 20:30)
   workflow_dispatch:
 
 permissions:
@@ -33,6 +36,7 @@ jobs:
       - name: Run bot
         timeout-minutes: 22
         env:
+          CRON_SCHEDULE: ${{ github.event.schedule }}
           DISCORD_WEBHOOK_CARHARTT: ${{ secrets.DISCORD_WEBHOOK_CARHARTT }}
           DISCORD_WEBHOOK_RALPHLAUREN: ${{ secrets.DISCORD_WEBHOOK_RALPHLAUREN }}
           DISCORD_WEBHOOK_FOOTBALLSHIRTS: ${{ secrets.DISCORD_WEBHOOK_FOOTBALLSHIRTS }}
