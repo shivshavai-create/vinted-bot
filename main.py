@@ -1,4 +1,5 @@
 import datetime
+import io
 import json
 import re
 import statistics
@@ -9,12 +10,29 @@ import urllib.parse
 import requests
 from vinted_scraper import VintedScraper
 
+try:
+    from PIL import Image, ImageOps
+    PIL_OK = True
+    RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
+except ImportError:
+    PIL_OK = False
+    RESAMPLE = None
+
 import config as cfg
 
+# UK ONLY: the scraper only ever talks to vinted.co.uk
 BASE_URL = "https://www.vinted.co.uk"
+UK_HOST = "vinted.co.uk"
+# False = a listing is accepted when the data does not say where the seller lives
+# (it is still blocked if currency/country is shown and is NOT GBP / United Kingdom).
+# True = block anything that cannot be PROVEN to be UK.
+UK_REQUIRE_COUNTRY_PROOF = False
+
 SEEN_FILE = "seen.json"
 ALERTED_FILE = "alerted.json"
 STATS_FILE = "stats.json"
+RECENT_FILE = "recent_sellers.json"
+RECENT_SECONDS = 24 * 60 * 60
 VALID_KINDS = {"tops", "bottoms", "shoes", "football", None}
 POUND = "\u00a3"
 START_TIME = time.time()
@@ -44,6 +62,8 @@ ACCESSORY_RES = {
     for ch, words in cfg.ACCESSORY_WORDS_BY_CHANNEL.items()
 }
 _banned_cache = {}
+
+UK_COUNTRY_NAMES = ("united kingdom", "great britain", "england", "scotland", "wales", "northern ireland")
 
 
 # ---------------------------------------------------------------
@@ -115,6 +135,25 @@ def get_image_url(item):
     return None
 
 
+def get_photo_urls(item):
+    """All photo links we can find for the listing (best quality first)."""
+    urls = []
+    photos = field(item, "photos")
+    if isinstance(photos, (list, tuple)):
+        for p in photos:
+            for key in ("full_size_url", "url"):
+                v = field(p, key)
+                if isinstance(v, str) and v.startswith("http"):
+                    if v not in urls:
+                        urls.append(v)
+                    break
+    if not urls:
+        main = get_image_url(item)
+        if main:
+            urls.append(main)
+    return urls
+
+
 def text_field(item, *names):
     """First non-empty text value among the given field names."""
     for n in names:
@@ -127,7 +166,15 @@ def text_field(item, *names):
 def lens_link(img):
     if not img:
         return None
-    return "[\U0001F50D Google Lens Check](https://lens.google.com/uploadbyurl?url=" + urllib.parse.quote(img, safe="") + ")"
+    return "[\U0001F4F7 Google Lens](https://lens.google.com/uploadbyurl?url=" + urllib.parse.quote(img, safe="") + ")"
+
+
+def fast_buy_url(item_id):
+    return BASE_URL + "/transaction/buy/new?source_screen=item&transaction%5Bitem_id%5D=" + str(item_id)
+
+
+def wardrobe_url(seller_id):
+    return BASE_URL + "/member/" + str(seller_id) if seller_id else BASE_URL
 
 
 def clean_title(t):
@@ -156,6 +203,247 @@ def search_with_retry(query):
             print("[WARN] Search attempt " + str(attempt + 1) + " failed for '" + query + "': " + str(e)[:120])
             time.sleep(4 * (attempt + 1))
     return None
+
+
+# ---------------------------------------------------------------
+# UK-ONLY checks (currency, link and seller country)
+# ---------------------------------------------------------------
+def get_currency(item):
+    raw = field(item, "price")
+    if raw is not None and not isinstance(raw, (str, int, float)):
+        c = field(raw, "currency_code") or field(raw, "currency")
+        if c:
+            return str(c).strip().upper()
+    c = field(item, "currency")
+    if isinstance(c, str) and c.strip():
+        return c.strip().upper()
+    return None
+
+
+def get_country(item):
+    user = field(item, "user")
+    for src in (user, item):
+        if src is None:
+            continue
+        for name in ("country_iso_code", "country_code", "country_title", "country_title_local", "country"):
+            v = field(src, name)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
+
+def is_uk_country(value):
+    s = str(value).strip().lower()
+    if len(s) <= 3:
+        return s in ("gb", "uk", "gbr")
+    return any(n in s for n in UK_COUNTRY_NAMES)
+
+
+def listing_is_uk(item):
+    """Search-stage check. Returns (ok, reason)."""
+    host = urllib.parse.urlparse(full_url(field(item, "url"))).netloc.lower()
+    if not host.endswith(UK_HOST):
+        return False, "link is not vinted.co.uk"
+    cur = get_currency(item)
+    if cur is None:
+        if UK_REQUIRE_COUNTRY_PROOF:
+            return False, "currency unknown"
+    elif cur not in ("GBP", POUND):
+        return False, "currency " + cur
+    country = get_country(item)
+    if country is not None and not is_uk_country(country):
+        return False, "country " + country
+    return True, None
+
+
+# ---------------------------------------------------------------
+# extra listing details (fee, publish time, reviews, photos)
+# ---------------------------------------------------------------
+def to_unix(v):
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        x = float(v)
+        if x > 1e12:
+            x = x / 1000.0
+        return int(x) if x > 1e9 else None
+    s = str(v).strip()
+    if s.isdigit():
+        return to_unix(int(s))
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return int(dt.timestamp())
+    except ValueError:
+        return None
+
+
+def get_created_ts(item):
+    for name in ("created_at_ts", "created_at"):
+        ts = to_unix(field(item, name))
+        if ts:
+            return ts
+    photo = field(item, "photo")
+    if photo:
+        hi = field(photo, "high_resolution")
+        if hi:
+            ts = to_unix(field(hi, "timestamp"))
+            if ts:
+                return ts
+        ts = to_unix(field(photo, "timestamp"))
+        if ts:
+            return ts
+    return None
+
+
+def get_fee_info(item, price):
+    """Returns (fee, estimated). Uses Vinted's own numbers when present."""
+    total = parse_price(field(item, "total_item_price"))
+    if total is not None and total > price:
+        return round(total - price, 2), False
+    fee = parse_price(field(item, "service_fee"))
+    if fee is not None and fee > 0:
+        return round(fee, 2), False
+    return round(0.80 + 0.04 * price, 2), True     # buyer protection estimate
+
+
+def seller_avatar(item):
+    user = field(item, "user")
+    photo = field(user, "photo") if user is not None else None
+    if photo:
+        for key in ("url", "full_size_url"):
+            v = field(photo, key)
+            if isinstance(v, str) and v.startswith("http"):
+                return v
+    return None
+
+
+def extract_extras(item, price):
+    fee, est = get_fee_info(item, price)
+    user = field(item, "user")
+    return {
+        "country": get_country(item),
+        "photos": get_photo_urls(item),
+        "created_ts": get_created_ts(item),
+        "description": str(field(item, "description", "") or "").strip(),
+        "fee": fee, "fee_estimated": est,
+        "rep": to_float(field(user, "feedback_reputation")),
+        "rep_count": to_float(field(user, "feedback_count")),
+    }
+
+
+_detail_cache = {}
+_detail_state = {"fails": 0}
+
+
+def fetch_item_detail(item_id):
+    """Full listing lookup (cached). Returns None if the scraper cannot do it."""
+    if item_id in _detail_cache:
+        return _detail_cache[item_id]
+    if _detail_state["fails"] >= 3 or not hasattr(scraper, "item"):
+        return None
+    result = None
+    try:
+        res = scraper.item(item_id)
+        if isinstance(res, dict) and isinstance(res.get("item"), dict):
+            res = res["item"]
+        elif not isinstance(res, dict):
+            inner = getattr(res, "item", None)
+            if inner is not None and not callable(inner):
+                res = inner
+        if res:
+            result = res
+            _detail_state["fails"] = 0
+        else:
+            _detail_state["fails"] += 1
+    except Exception as e:
+        _detail_state["fails"] += 1
+        print("[WARN] Item lookup failed for " + str(item_id) + ": " + str(e)[:100])
+    if _detail_state["fails"] >= 3:
+        print("[WARN] Item lookups switched off for this run (the scraper could not fetch listings).")
+    _detail_cache[item_id] = result
+    time.sleep(1)
+    return result
+
+
+def enrich_and_verify(d):
+    """Fills gaps from the full listing and confirms the seller is UK. Returns (ok, reason)."""
+    need = (d["country"] is None or len(d["photos"]) < 3 or d["created_ts"] is None
+            or not d["description"] or d["fee_estimated"])
+    if need:
+        detail = fetch_item_detail(d["id"])
+        if detail is not None:
+            cur = get_currency(detail)
+            if cur is not None and cur not in ("GBP", POUND):
+                return False, "currency " + cur
+            ex = extract_extras(detail, d["price"])
+            if d["country"] is None:
+                d["country"] = ex["country"]
+            if len(ex["photos"]) > len(d["photos"]):
+                d["photos"] = ex["photos"]
+            if d["created_ts"] is None:
+                d["created_ts"] = ex["created_ts"]
+            if not d["description"]:
+                d["description"] = ex["description"]
+            if d["fee_estimated"] and not ex["fee_estimated"]:
+                d["fee"], d["fee_estimated"] = ex["fee"], False
+            if d["rep"] is None:
+                d["rep"] = ex["rep"]
+            if d["rep_count"] is None:
+                d["rep_count"] = ex["rep_count"]
+            if not d.get("image") and d["photos"]:
+                d["image"] = d["photos"][0]
+    if d["country"] is not None and not is_uk_country(d["country"]):
+        return False, "country " + str(d["country"])
+    if d["country"] is None and UK_REQUIRE_COUNTRY_PROOF:
+        return False, "seller country unknown"
+    return True, None
+
+
+# ---------------------------------------------------------------
+# 3-photo collage (Pillow): 1 big photo left, 2 small stacked photos right
+# ---------------------------------------------------------------
+def download_image(url):
+    try:
+        r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200 and r.content:
+            return Image.open(io.BytesIO(r.content)).convert("RGB")
+    except Exception as e:
+        print("[WARN] Photo download failed: " + str(e)[:80])
+    return None
+
+
+def build_collage(urls):
+    """Returns PNG bytes, or None (then the embed just uses the main photo link)."""
+    if not PIL_OK or len(urls) < 2:
+        return None
+    imgs = []
+    for u in urls[:3]:
+        im = download_image(u)
+        if im is not None:
+            imgs.append(im)
+    if len(imgs) < 2:
+        return None
+    try:
+        W, H, GAP = 1200, 800, 6
+        left_w = 796
+        right_x = left_w + GAP
+        right_w = W - right_x
+        canvas = Image.new("RGB", (W, H), (32, 34, 37))
+        canvas.paste(ImageOps.fit(imgs[0], (left_w, H), RESAMPLE), (0, 0))
+        if len(imgs) == 2:
+            canvas.paste(ImageOps.fit(imgs[1], (right_w, H), RESAMPLE), (right_x, 0))
+        else:
+            half = (H - GAP) // 2
+            canvas.paste(ImageOps.fit(imgs[1], (right_w, half), RESAMPLE), (right_x, 0))
+            canvas.paste(ImageOps.fit(imgs[2], (right_w, half), RESAMPLE), (right_x, half + GAP))
+        buf = io.BytesIO()
+        canvas.save(buf, "PNG")
+        return buf.getvalue()
+    except Exception as e:
+        print("[WARN] Collage failed: " + str(e)[:100])
+        return None
 
 
 # ---------------------------------------------------------------
@@ -206,10 +494,27 @@ def load_state(today):
     return seen, alerted, day
 
 
-def save_state(seen, alerted, day):
+def load_recent():
+    """seller id -> Unix time of their last alert. Anything older than 24 hours is dropped."""
+    raw = read_json(RECENT_FILE)
+    out = {}
+    now = time.time()
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            ts = to_float(v)
+            if ts is not None and now - ts < RECENT_SECONDS:
+                out[str(k)] = ts
+    return out
+
+
+def save_state(seen, alerted, day, recent):
+    now = time.time()
+    for k in [k for k, v in recent.items() if now - v >= RECENT_SECONDS]:
+        del recent[k]
     write_json(SEEN_FILE, seen)
     write_json(ALERTED_FILE, alerted)
     write_json(STATS_FILE, day)
+    write_json(RECENT_FILE, recent)
 
 
 def make_fp(seller, title):
@@ -219,6 +524,10 @@ def make_fp(seller, title):
         return None
     words = re.findall(r"\w+", title.lower())
     return str(who) + "|" + " ".join(words)[:120]
+
+
+def seller_key(d):
+    return str(d.get("seller_id") or d.get("seller_login") or "")
 
 
 # ---------------------------------------------------------------
@@ -262,6 +571,9 @@ def validate_config():
     for dest in sorted(cfg.WEBHOOK_SECRETS):
         if not cfg.get_webhook(dest):
             warnings.append("No webhook secret found for '" + dest + "' - its alerts cannot be sent")
+
+    if not PIL_OK:
+        warnings.append("Pillow is not installed - collages are switched off (single photo used instead)")
 
     for w in warnings:
         print("[CONFIG WARNING] " + w)
@@ -489,36 +801,11 @@ def suggest_offer(price):
 # ---------------------------------------------------------------
 # visual helpers
 # ---------------------------------------------------------------
-def tier_label(profit):
-    for threshold, label in cfg.PROFIT_TIERS:
-        if profit >= threshold:
-            return label
-    return cfg.PROFIT_TIERS[-1][1]
+HOT_BANNER = "\U0001F6A8 HOT STREAK SELLER \u2014 CHECK WARDROBE NOW"
 
 
 def deal_roi(d):
     return (d["net_profit"] / d["price"]) if d["price"] > 0 else 0.0
-
-
-def score_stars(roi):
-    roi = max(roi, 0.0)
-    if roi >= 3.0:
-        n = 5
-    elif roi >= 2.0:
-        n = 4
-    elif roi >= 1.2:
-        n = 3
-    elif roi >= 0.8:
-        n = 2
-    else:
-        n = 1
-    return "\u2B50" * n + "\u2606" * (5 - n)
-
-
-def roi_bar(roi):
-    roi = max(roi, 0.0)
-    blocks = min(10, int(round(roi / 3.0 * 10)))
-    return "\u25B0" * blocks + "\u25B1" * (10 - blocks) + "  " + str(int(round(roi * 100))) + "%"
 
 
 def mk_field(name, value, inline=True):
@@ -529,10 +816,27 @@ def now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def reviews_text(rep, count):
+    if rep is None and not count:
+        return "No reviews yet"
+    r = rep if rep is not None else 0.0
+    if r > 1.0:
+        r = r / 5.0
+    n = max(0, min(5, int(round(r * 5))))
+    return "\u2B50" * n + "\u2606" * (5 - n) + " (" + str(int(count or 0)) + ")"
+
+
+def short_desc(text):
+    t = " ".join(str(text or "").split())
+    if not t:
+        return "No description provided"
+    return t[:150] + ("..." if len(t) > 150 else "")
+
+
 # ---------------------------------------------------------------
 # discord
 # ---------------------------------------------------------------
-def post_payload(destination, payload, mentions=None, username=None, avatar=None):
+def post_payload(destination, payload, mentions=None, username=None, avatar=None, files=None):
     webhook = cfg.get_webhook(destination)
     if not webhook:
         print("[WARN] No webhook secret set for " + destination)
@@ -546,7 +850,13 @@ def post_payload(destination, payload, mentions=None, username=None, avatar=None
     r = None
     for attempt in range(3):
         try:
-            r = requests.post(webhook, json=body, timeout=15)
+            if files:
+                multipart = {"files[" + str(i) + "]": (name, data, "image/png")
+                             for i, (name, data) in enumerate(files)}
+                r = requests.post(webhook, data={"payload_json": json.dumps(body)},
+                                  files=multipart, timeout=40)
+            else:
+                r = requests.post(webhook, json=body, timeout=15)
         except requests.RequestException as e:
             print("[WARN] Discord request failed: " + str(e)[:100])
             time.sleep(2)
@@ -569,10 +879,11 @@ def post_text(destination, text):
     return post_payload(destination, {"content": text[:1900]})
 
 
-def build_single_embed(d):
+def build_single_embed(d, collage_ok):
     roi = deal_roi(d)
     tag = cfg.CATEGORY_TAG.get(d["channel"], "")
-    icon = cfg.CATEGORY_ICON.get(d["channel"], "")
+    total = d["price"] + d["fee"]
+    est = "~" if d["fee_estimated"] else ""
 
     flags = []
     if d.get("era_note"):
@@ -594,50 +905,62 @@ def build_single_embed(d):
     if d.get("ping"):
         flags.append("BARGAIN PING")
 
-    fields = [
-        mk_field("\U0001F4B7 Ask", money(d["price"])),
-        mk_field("\U0001F3F7\uFE0F Resell", money(d["resell"])),
-        mk_field("\U0001F4B0 Profit", "+" + money(d["net_profit"])),
-        mk_field("\U0001F4C8 ROI", roi_bar(roi), False),
-    ]
-    if d.get("size"):
-        fields.append(mk_field("\U0001F4CF Size", d["size"]))
-    if d.get("status"):
-        fields.append(mk_field("\u2728 Condition", d["status"]))
-    if d.get("brand"):
-        fields.append(mk_field("\U0001F3E2 Brand", d["brand"]))
-    if d["offer"] is not None:
-        fields.append(mk_field("\U0001F91D Offer " + money(d["offer"]),
-                               "Profit with offer: +" + money(d["profit_offer"]), False))
-        fields.append(mk_field("\U0001F4AC Copy and send",
-                               "```" + cfg.OFFER_MESSAGE.replace("{offer}", money(d["offer"])) + "```", False))
-    if flags:
-        fields.append(mk_field("\U0001F3AF Flags", "\n".join("\u2022 " + f for f in flags), False))
-    fields.append(mk_field("\U0001F50E Check before buying",
-                           cfg.CHECKLISTS.get(d["channel"], "Inspect tags and stitching carefully"), False))
+    desc_lines = []
+    if d.get("hot"):
+        desc_lines.append("**" + HOT_BANNER + "**")
+    desc_lines.append(short_desc(d.get("description")))
 
-    links = ["[\U0001F6D2 Open on Vinted](" + d["url"] + ")"]
+    published = "<t:" + str(d["created_ts"]) + ":R>" if d.get("created_ts") else "Unknown"
+
+    # the 6-field grid: two rows of three
+    fields = [
+        mk_field("\U0001F4B0 Price", format(d["price"], ".2f") + " " + POUND
+                 + " (+ " + est + format(d["fee"], ".2f") + " " + POUND + ")"),
+        mk_field("\U0001F3F7\uFE0F Brand", d.get("brand") or "Not specified"),
+        mk_field("\U0001F4CF Size", d.get("size") or "Not specified"),
+        mk_field("\u2728 Condition", d.get("status") or "Not specified"),
+        mk_field("\u23F1\uFE0F Published", published),
+        mk_field("\U0001F31F Reviews", reviews_text(d.get("rep"), d.get("rep_count"))),
+    ]
+
+    links = [
+        "**[\u26A1 Fast Buy](" + fast_buy_url(d["id"]) + ")**",
+        "[\U0001F50D View](" + d["url"] + ")",
+        "[\U0001F464 Seller Wardrobe](" + wardrobe_url(d.get("seller_id")) + ")",
+    ]
     lens = lens_link(d.get("image"))
     if lens:
         links.append(lens)
-    links.append("[\U0001F4C8 eBay sold comps](" + sold_link(d["title"]) + ")")
+    links.append("[\U0001F4C8 eBay Sold](" + sold_link(d["title"]) + ")")
     fields.append(mk_field("\U0001F517 Links", "  \u00B7  ".join(links), False))
 
+    profit_lines = ["Resell " + money(d["resell"]) + "  \u00B7  Profit **+" + money(d["net_profit"])
+                    + "**  \u00B7  ROI " + str(int(round(roi * 100))) + "%"]
+    if d["offer"] is not None:
+        profit_lines.append("\U0001F91D Offer " + money(d["offer"]) + " \u2192 profit +" + money(d["profit_offer"]))
+        profit_lines.append("```" + cfg.OFFER_MESSAGE.replace("{offer}", money(d["offer"])) + "```")
+    if flags:
+        profit_lines.append("\U0001F3AF " + "  \u00B7  ".join(flags))
+    fields.append(mk_field("\U0001F4B9 Profit check", "\n".join(profit_lines), False))
+
     embed = {
-        "title": (tier_label(d["net_profit"]) + " | " + tag + " " + d["title"]).strip()[:250],
+        "title": ("\U0001F1EC\U0001F1E7 " + d["title"][:200] + " | " + format(total, ".2f") + " " + POUND)[:250],
         "url": d["url"],
         "color": cfg.CATEGORY_COLOUR.get(d["channel"], 0x95A5A6),
-        "description": "**" + score_stars(roi) + "**  deal score",
+        "description": "\n".join(desc_lines)[:1000],
         "fields": fields,
-        "footer": {"text": "Deal Hunter " + icon + " " + tag},
-        "timestamp": now_iso(),
+        "footer": {"text": (tag + "  \u00B7  " + cfg.CHECKLISTS.get(d["channel"], "Inspect tags and stitching carefully"))[:300]},
     }
-    if d.get("seller_login"):
-        author = {"name": "\U0001F464 " + str(d["seller_login"])}
-        if d.get("seller_id"):
-            author["url"] = BASE_URL + "/member/" + str(d["seller_id"])
-        embed["author"] = author
-    if d.get("image"):
+    author = {"name": str(d.get("seller_login") or "Unknown seller")[:200]}
+    if d.get("seller_id"):
+        author["url"] = wardrobe_url(d["seller_id"])
+    if d.get("avatar"):
+        author["icon_url"] = d["avatar"]
+    embed["author"] = author
+
+    if collage_ok:
+        embed["image"] = {"url": "attachment://collage.png"}
+    elif d.get("image"):
         embed["image"] = {"url": d["image"]}
     return embed
 
@@ -659,7 +982,7 @@ def build_bundle_embeds(deals):
         tag = cfg.CATEGORY_TAG.get(x["channel"], "")
         value = (money(x["price"]) + " ask  \u00B7  resell " + money(x["resell"])
                  + "  \u00B7  profit **+" + money(x["net_profit"]) + "**\n"
-                 + "[\U0001F6D2 Open](" + x["url"] + ")")
+                 + "**[\u26A1 Fast Buy](" + fast_buy_url(x["id"]) + ")**  \u00B7  [\U0001F50D View](" + x["url"] + ")")
         lens = lens_link(x.get("image"))
         if lens:
             value += "  \u00B7  " + lens
@@ -671,12 +994,17 @@ def build_bundle_embeds(deals):
         "title": "\U0001F4E6 MULTI-ITEM WARDROBE DROP",
         "url": shown[0]["url"],
         "color": cfg.BUNDLE_COLOUR,
-        "description": "**" + str(len(deals)) + " matching items** from **" + str(seller)
+        "description": "**" + HOT_BANNER + "**\n**" + str(len(deals)) + " matching items** from **" + str(seller)
                        + "**\n\U0001F4AC Ask for a bundle price before buying one by one!",
         "fields": fields,
         "footer": {"text": "Deal Hunter \U0001F4E6 bundle"},
         "timestamp": now_iso(),
     }
+    author = {"name": str(seller)[:200]}
+    if deals[0].get("seller_id"):
+        author["url"] = wardrobe_url(deals[0]["seller_id"])
+    main["author"] = author
+
     embeds = [main]
     if shown[0].get("image"):
         main["image"] = {"url": shown[0]["image"]}
@@ -702,11 +1030,22 @@ def send_single(d):
     mentions = {"parse": ["everyone"] if everyone else []}
     if roles:
         mentions["roles"] = roles
+
+    collage = build_collage(d.get("photos") or [])
+    files = [("collage.png", collage)] if collage else None
     ok = post_payload(dest,
-                      {"content": " ".join(content_parts), "embeds": [build_single_embed(d)]},
+                      {"content": " ".join(content_parts), "embeds": [build_single_embed(d, bool(collage))]},
                       mentions,
                       username=cfg.CATEGORY_BOT_NAME.get(d["channel"]),
-                      avatar=cfg.CATEGORY_AVATAR.get(d["channel"]))
+                      avatar=cfg.CATEGORY_AVATAR.get(d["channel"]),
+                      files=files)
+    if not ok and files:
+        # retry once without the collage so a big upload can never lose the alert
+        ok = post_payload(dest,
+                          {"content": " ".join(content_parts), "embeds": [build_single_embed(d, False)]},
+                          mentions,
+                          username=cfg.CATEGORY_BOT_NAME.get(d["channel"]),
+                          avatar=cfg.CATEGORY_AVATAR.get(d["channel"]))
     if ok:
         print("[SENT] #" + dest + ": " + d["title"])
     return ok
@@ -755,7 +1094,7 @@ def send_bundle(deals):
 # ---------------------------------------------------------------
 STAT_KEYS = ["checked", "already_alerted", "relist_blocked", "kids", "accessory_blocked",
              "brand_mismatch", "keyword_missing", "modern_skipped", "condition_flags",
-             "junk_or_size", "seller_filtered", "price_out_of_range", "low_profit",
+             "junk_or_size", "seller_filtered", "non_uk", "price_out_of_range", "low_profit",
              "qualified", "sent", "bundles", "errors"]
 
 
@@ -789,7 +1128,7 @@ def maybe_send_daily_summary(day_stats):
         "Blocked: kids " + str(g("kids", 0)) + ", accessories " + str(g("accessory_blocked", 0))
         + ", wrong brand " + str(g("brand_mismatch", 0))
         + ", condition " + str(g("condition_flags", 0)) + ", junk/size " + str(g("junk_or_size", 0))
-        + ", sellers " + str(g("seller_filtered", 0)),
+        + ", sellers " + str(g("seller_filtered", 0)) + ", non-UK " + str(g("non_uk", 0)),
         "Repeat protection: already alerted " + str(g("already_alerted", 0))
         + ", relists blocked " + str(g("relist_blocked", 0)),
         "Too expensive: " + str(g("price_out_of_range", 0)) + ", profit too low: " + str(g("low_profit", 0)),
@@ -843,12 +1182,15 @@ def run():
     now = datetime.datetime.now(datetime.timezone.utc)
     today = now.strftime("%Y-%m-%d")
     seen, alerted, day = load_state(today)
+    recent = load_recent()
     if day.get("day") != today:
         maybe_send_daily_summary(day)
         day = new_day_stats(today)
 
+    print("[UK ONLY] searching " + BASE_URL + " | GBP listings and UK sellers only")
     print("[STATE] checked-before: " + str(len(seen)) + " | alerted ids: " + str(len(alerted["ids"]))
-          + " | alerted relist fingerprints: " + str(len(alerted["fps"])))
+          + " | alerted relist fingerprints: " + str(len(alerted["fps"]))
+          + " | sellers alerted in last 24h: " + str(len(recent)))
 
     deals = []
     queued = set()
@@ -923,6 +1265,13 @@ def run():
                         size_title = str(size_title)
 
                     if price is None:
+                        continue
+
+                    # UK ONLY: GBP price, a vinted.co.uk link and (when shown) a UK seller
+                    uk_ok, uk_reason = listing_is_uk(item)
+                    if not uk_ok:
+                        stats["non_uk"] += 1
+                        seen[item_id] = today
                         continue
 
                     if must_match and not any(m in title.lower() for m in must_match):
@@ -1044,6 +1393,7 @@ def run():
                         profit_offer = resell * (1 - cfg.RESELL_FEE_PCT) - offer - postage
 
                     ping = bool(ping_under is not None and price <= ping_under)
+                    ex = extract_extras(item, price)
 
                     stats["qualified"] += 1
                     queued.add(item_id)
@@ -1052,6 +1402,11 @@ def run():
                     deals.append({
                         "id": item_id, "title": title, "price": price,
                         "url": full_url(field(item, "url")), "image": get_image_url(item),
+                        "photos": ex["photos"], "created_ts": ex["created_ts"],
+                        "description": ex["description"] or desc.strip(),
+                        "fee": ex["fee"], "fee_estimated": ex["fee_estimated"],
+                        "country": ex["country"], "avatar": seller_avatar(item),
+                        "rep": seller["rep"], "rep_count": seller["count"],
                         "size": size_title or text_field(item, "size"),
                         "status": text_field(item, "status", "condition"),
                         "brand": brand_field or None,
@@ -1061,7 +1416,7 @@ def run():
                         "seller_login": seller["login"], "seller_id": seller["id"],
                         "offer": offer, "profit_offer": profit_offer,
                         "era_note": era_note, "alert_under": alert_under,
-                        "market_note": None, "fp": fp, "ping": ping,
+                        "market_note": None, "fp": fp, "ping": ping, "hot": False,
                     })
                 except Exception as e:
                     stats["errors"] += 1
@@ -1118,8 +1473,33 @@ def run():
                 per_channel[d["channel"]] = per_channel.get(d["channel"], 0) + 1
             to_send.append(u)
 
-        sent = 0
+        # final UK check + fill in the details (fee, publish time, photos) before anything is sent
+        verified = []
         for u in to_send:
+            keep = []
+            for d in u["deals"]:
+                ok, reason = enrich_and_verify(d)
+                if ok:
+                    keep.append(d)
+                else:
+                    stats["non_uk"] += 1
+                    seen[d["id"]] = today
+                    print("[UK ONLY] Blocked '" + d["title"][:50] + "': " + str(reason))
+            if not keep:
+                continue
+            u["deals"] = keep
+            if u["type"] == "bundle" and len(keep) < cfg.BUNDLE_MIN_ITEMS:
+                u["type"] = "single"
+            verified.append(u)
+
+        sent = 0
+        for u in verified:
+            # hot streak: this seller already matched in the last 24 hours
+            now_ts = time.time()
+            for d in u["deals"]:
+                k = seller_key(d)
+                d["hot"] = bool(k and k in recent and now_ts - recent[k] < RECENT_SECONDS)
+
             if u["type"] == "bundle":
                 ok = send_bundle(u["deals"])
             else:
@@ -1131,11 +1511,14 @@ def run():
                     alerted["ids"][d["id"]] = today
                     if d["fp"]:
                         alerted["fps"][d["fp"]] = today
+                    k = seller_key(d)
+                    if k:
+                        recent[k] = time.time()
                     if d["net_profit"] > day.get("best_profit", 0.0):
                         day["best_profit"] = d["net_profit"]
                         day["best_title"] = d["title"]
                     remember_top(day, d)
-                save_state(seen, alerted, day)
+                save_state(seen, alerted, day, recent)
                 sent += 1
                 if u["type"] == "bundle":
                     stats["bundles"] += 1
@@ -1155,6 +1538,7 @@ def run():
         print("Already alerted (blocked): " + str(stats["already_alerted"]))
         print("Relists blocked:         " + str(stats["relist_blocked"]))
         print("Already seen (skipped):  " + str(stats["already_seen"]))
+        print("Non-UK blocked:          " + str(stats["non_uk"]))
         print("Kids items blocked:      " + str(stats["kids"]))
         print("Accessories blocked:     " + str(stats["accessory_blocked"]))
         print("Wrong brand blocked:     " + str(stats["brand_mismatch"]))
@@ -1176,7 +1560,7 @@ def run():
                 print("  GBP " + format(price, ".2f") + " '" + title[:50] + "' -> profit GBP " + format(profit, ".2f"))
     finally:
         # always write state, even if something above went wrong
-        save_state(seen, alerted, day)
+        save_state(seen, alerted, day, recent)
 
 
 if __name__ == "__main__":
